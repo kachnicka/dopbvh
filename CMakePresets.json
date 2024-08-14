@@ -1,0 +1,117 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "generator": "Ninja"
+    },
+    {
+      "name": "default-gcc",
+      "inherits": "default",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_EXE_LINKER_FLAGS": {
+          "type": "STRING",
+          "value": "-fuse-ld=mold"
+        },
+        "CMAKE_SHARED_LINKER_FLAGS": {
+          "type": "STRING",
+          "value": "-fuse-ld=mold"
+        },
+        "CMAKE_MODULE_LINKER_FLAGS": {
+          "type": "STRING",
+          "value": "-fuse-ld=mold"
+        }
+      }
+    },
+    {
+      "name": "default-clang",
+      "inherits": "default",
+      "hidden": true,
+      "toolchainFile": "${sourceDir}/cmake/toolchain/clang.cmake",
+      "cacheVariables": {
+        "CMAKE_EXE_LINKER_FLAGS": {
+          "type": "STRING",
+          "value": "-fuse-ld=lld -nostdlib++ /usr/lib/libc++.a /usr/lib/libc++abi.a"
+        },
+        "CMAKE_SHARED_LINKER_FLAGS": {
+          "type": "STRING",
+          "value": "-fuse-ld=lld -nostdlib++ /usr/lib/libc++.a /usr/lib/libc++abi.a"
+        },
+        "CMAKE_MODULE_LINKER_FLAGS": {
+          "type": "STRING",
+          "value": "-fuse-ld=lld -nostdlib++ /usr/lib/libc++.a /usr/lib/libc++abi.a"
+        }
+      }
+    },
+    {
+      "name": "cfg-gcc-mold-release",
+      "displayName": "Linux: x64, gcc, mold (release)",
+      "inherits": "default-gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "cfg-gcc-mold-debug",
+      "displayName": "Linux: x64, gcc, mold (debug)",
+      "inherits": "default-gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "cfg-clang-lld-release",
+      "displayName": "Linux: x64, clang, lld (release)",
+      "inherits": "default-clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "cfg-clang-lld-debug",
+      "displayName": "Linux: x64, clang, lld (debug)",
+      "inherits": "default-clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-gcc-mold-release",
+      "displayName": "Linux (x64, gcc, mold) Release",
+      "configuration": "Release",
+      "jobs": 16,
+      "configurePreset": "cfg-gcc-mold-release"
+    },
+    {
+      "name": "build-gcc-mold-debug",
+      "displayName": "Linux (x64, gcc, mold) Debug",
+      "configuration": "Debug",
+      "jobs": 16,
+      "configurePreset": "cfg-gcc-mold-debug"
+    },
+    {
+      "name": "build-clang-lld-release",
+      "displayName": "Linux (x64, clang, lld) Release",
+      "configuration": "Release",
+      "jobs": 16,
+      "configurePreset": "cfg-clang-lld-release"
+    },
+    {
+      "name": "build-clang-lld-debug",
+      "displayName": "Linux (x64, clang, lld) Debug",
+      "configuration": "Debug",
+      "jobs": 16,
+      "configurePreset": "cfg-clang-lld-debug"
+    }
+  ]
+}

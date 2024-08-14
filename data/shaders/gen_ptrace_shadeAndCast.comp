@@ -1,0 +1,169 @@
+#version 460
+
+#extension GL_EXT_buffer_reference2: require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: require
+
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_EXT_shader_realtime_clock: require
+
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#extension GL_GOOGLE_include_directive : enable
+
+#define INCLUDE_FROM_SHADER
+#include "data_bvh.h"
+#include "data_scene.h"
+#include "data_types_general.glsl"
+
+// TODO: include based on volume used
+#include "bv_aabb.glsl"
+#include "bv_dop14.glsl"
+
+#include "bvh_compressed_binary.glsl"
+
+#include "random.glsl"
+#include "rayCommon.glsl"
+
+layout(set = 0, binding = 0, rgba32f) uniform image2D image;
+layout(set = 0, binding = 1) uniform Camera {
+    mat4 view;
+    mat4 projection;
+    mat4 viewInv;
+    mat4 projectionInv;
+} camera;
+layout(push_constant) uniform uPushConstant
+{
+    PC_PT data;
+    
+} pc;
+layout (local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+#define EPS 1e-5f
+#define INVALID_ID -1
+#define STACK_SIZE 64
+#define DYNAMIC_FETCH_THRESHOLD 20
+#define BOTTOM_OF_STACK 0x76543210
+
+#define MAX_DEPTH 7
+
+struct RayInfo {
+    RayBuf rayBuffer;
+    RayPayloadBuf rayPayload;
+};
+
+void main()
+{
+    RayBufferMetadata_ref rayBufMeta = RayBufferMetadata_ref(pc.data.rayBufferMetadataAddress);
+
+    const uint depth = rayBufMeta.data_0.depth_TMP;
+    const bool useIdx0 = (depth % 2) == 0;
+    RayInfo rayInfoRead = useIdx0
+        ? RayInfo(RayBuf(pc.data.rayBuffer0Address), RayPayloadBuf(pc.data.rayPayload0Address))
+        : RayInfo(RayBuf(pc.data.rayBuffer1Address), RayPayloadBuf(pc.data.rayPayload1Address));
+
+    const uint rayCount = useIdx0 ? rayBufMeta.data_0.rayCount : rayBufMeta.data_1.rayCount;
+
+    const uint rayId = gl_GlobalInvocationID.x;
+
+    if (rayId >= rayCount)
+        return;
+
+    uint32_t packedPixelPos = rayInfoRead.rayPayload.val[rayId].packedPosition;
+    ivec2 pixelPos = ivec2(packedPixelPos >> 18, (packedPixelPos >> 4) & 0x3FFF);
+
+    RayTraceResultBuf results = RayTraceResultBuf(pc.data.rayTraceResultAddress);
+    RayTraceResult result = results.result[rayId];
+    Ray r = rayInfoRead.rayBuffer.ray[rayId];
+
+
+    const vec3 clearColor = vec3(.15f);
+    vec3 throughput = rayInfoRead.rayPayload.val[rayId].throughput;
+    vec3 radiance = vec3(0.f);
+    vec3 accumulatedRadiance = vec3(0.f);
+    if (pc.data.samplesComputed > 0)
+        accumulatedRadiance = imageLoad(image, pixelPos).xyz;
+
+    vec3 env = vec3(max(0.f, dot(r.d.xyz, pc.data.dirLight.xyz)));
+    env *= pc.data.dirLight.w;
+
+    // hit environment
+    if (result.instanceId == INVALID_ID) {
+        if (depth == 0)
+            radiance = clearColor;
+        else
+            radiance = throughput * env;
+        radiance = (pc.data.samplesComputed * accumulatedRadiance + radiance) / float(pc.data.samplesComputed + 1);
+        imageStore(image, pixelPos, vec4(radiance, 1.f));
+        return;
+    }
+    if (depth + 1 > MAX_DEPTH) {
+        radiance = (pc.data.samplesComputed * accumulatedRadiance + radiance) / float(pc.data.samplesComputed + 1);
+        imageStore(image, pixelPos, vec4(radiance, 1.f));
+        return;
+    }
+
+
+    // cast secondary ray
+    GeometryDescriptor gDesc = GeometryDescriptor(pc.data.geometryDescriptorAddress);
+
+    Geometry g = gDesc.g[result.instanceId];
+    uvec3Buf indices = uvec3Buf(g.idxAddress);
+    const uvec3 idx = indices.val[result.primitiveId];
+    //    fvec3Buf vertices = fvec3Buf(g.vtxAddress);
+    //    const vec3 v0 = vertices.val[idx.x];
+    //    const vec3 v1 = vertices.val[idx.y];
+    //    const vec3 v2 = vertices.val[idx.z];
+    fvec3Buf normals = fvec3Buf(g.normalAddress);
+    const vec3 n0 = normals.val[idx.x];
+    const vec3 n1 = normals.val[idx.y];
+    const vec3 n2 = normals.val[idx.z];
+
+    //    const vec3 barycentrics = vec3(1.0 - result.u - result.v, result.u, result.v);
+    const vec3 barycentrics = vec3(result.u, result.v, 1.f - result.u - result.v);
+
+    const vec3 pos = r.o.xyz + r.d.xyz * result.t;
+    //    const vec3 pos = v0 * barycentrics.x + v1 * barycentrics.y + v2 * barycentrics.z;
+    vec3 nrm = n0 * barycentrics.x + n1 * barycentrics.y + n2 * barycentrics.z;
+    //    const vec3 worldNrm = normalize(vec3(nrm * prd.worldToObject));  // Transforming the normal to world space
+    //    const vec3 worldPos = vec3(prd.objectToWorld * vec4(pos, 1.0));  // Transforming the position to world space
+
+    uint32_t seed = rayInfoRead.rayPayload.val[rayId].seed;
+    // Lambert sample
+    const vec3 albedo = vec3(1.f);
+    const vec3 newDirection = SampleHemisphereCosineWorldSpace(rnd(seed), rnd(seed), nrm);
+    const float cosTheta = dot(newDirection, nrm);
+    const vec3 f = albedo * M_PI_INV;
+    const float pdf = cosTheta * M_PI_INV;
+
+    throughput *= (f * cosTheta) / pdf;
+    r.o = vec4(OffsetRay(pos, nrm), .01f);
+    r.d = vec4(newDirection, BIG_FLOAT);
+
+    RayInfo rayInfoWrite = useIdx0
+        ? RayInfo(RayBuf(pc.data.rayBuffer1Address), RayPayloadBuf(pc.data.rayPayload1Address))
+        : RayInfo(RayBuf(pc.data.rayBuffer0Address), RayPayloadBuf(pc.data.rayPayload0Address));
+
+    const uvec4 ballot = subgroupBallot(true);
+    uint32_t newRayId;
+    if (subgroupElect()) {
+//        newRayId = atomicAdd(useIdx0 ? rayBufMeta.data_1.rayCount : rayBufMeta.data_0.rayCount, subgroupBallotBitCount(ballot));
+        if (useIdx0)
+            newRayId = atomicAdd(rayBufMeta.data_1.rayCount, subgroupBallotBitCount(ballot));
+        else
+            newRayId = atomicAdd(rayBufMeta.data_0.rayCount, subgroupBallotBitCount(ballot));
+    }
+    newRayId = subgroupBroadcastFirst(newRayId) + subgroupBallotExclusiveBitCount(ballot);
+
+    packedPixelPos = (packedPixelPos & ~0xfu) | RAY_TYPE_SECONDARY;
+    rayInfoWrite.rayBuffer.ray[newRayId] = r;
+    rayInfoWrite.rayPayload.val[newRayId].packedPosition = packedPixelPos;
+    rayInfoWrite.rayPayload.val[newRayId].seed = seed;
+    rayInfoWrite.rayPayload.val[newRayId].throughput = throughput;
+
+    rayInfoWrite.rayPayload.val[newRayId].padding[0] += result.bvIntersectionCount;
+}

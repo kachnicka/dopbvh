@@ -1,0 +1,97 @@
+#version 460
+
+#extension GL_EXT_buffer_reference2: require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: require
+
+layout(local_size_x_id = 0) in;
+
+#extension GL_GOOGLE_include_directive : enable
+
+#define INCLUDE_FROM_SHADER
+#include "data_bvh.h"
+#include "data_plocpp.h"
+
+#include "bv_dop14.glsl"
+
+#include "bvh_compressed_binary.glsl"
+
+layout (push_constant, scalar) uniform uPushConstant {
+    PC_BvhStats data;
+} pc;
+
+shared float satAggregate;
+shared float saiAggregate;
+
+shared float ciAggregate;
+
+shared uint leafSizeSum;
+shared uint leafSizeMin;
+shared uint leafSizeMax;
+
+void main() {
+    if (gl_GlobalInvocationID.x >= (pc.data.nodeCount - 1))
+        return;
+    if (gl_LocalInvocationID.x == 0) {
+        satAggregate = 0.f;
+        saiAggregate = 0.f;
+        ciAggregate = 0.f;
+
+        leafSizeSum = 0;
+        leafSizeMin = 0xFFFFFFFF;
+        leafSizeMax = 0;
+    }
+    barrier();
+
+    
+    BvhBinaryDOP14Compressed bvh = BvhBinaryDOP14Compressed(pc.data.bvhAddress);
+    NodeBvhBinaryDOP14Compressed node = bvh.node[gl_GlobalInvocationID.x];
+
+    float saC0 = bvArea(getBoxC0(node));
+    float saC1 = bvArea(getBoxC1(node));
+
+    
+    if (node.c0 > 0) {
+        atomicAdd(satAggregate, saC0);
+    } else {
+        int32_t size = (node.c0 >> 27) & 0xF;
+        atomicAdd(saiAggregate, saC0);
+        atomicAdd(ciAggregate, size * saC0);
+
+        atomicAdd(leafSizeSum, size);
+        atomicMin(leafSizeMin, size);
+        atomicMax(leafSizeMax, size);
+    }
+
+    if (node.c1 > 0) {
+        atomicAdd(satAggregate, saC1);
+    } else {
+        int32_t size = (node.c1 >> 27) & 0xF;
+        atomicAdd(saiAggregate, saC1);
+        atomicAdd(ciAggregate, size * saC1);
+
+        atomicAdd(leafSizeSum, size);
+        atomicMin(leafSizeMin, size);
+        atomicMax(leafSizeMax, size);
+    }
+
+
+    barrier();
+    BvhStats stats = BvhStats(pc.data.resultBufferAddress);
+    if (gl_LocalInvocationID.x == 0) {
+        atomicAdd(stats.sat, satAggregate / pc.data.sceneAabbSurfaceArea);
+        atomicAdd(stats.sai, saiAggregate / pc.data.sceneAabbSurfaceArea);
+
+        
+        float sceneSA = bvArea(getBox(bvh.node[0]));
+
+        atomicAdd(stats.ct, pc.data.c_t * satAggregate / pc.data.sceneAabbSurfaceArea);
+        atomicAdd(stats.ci, pc.data.c_i * ciAggregate / pc.data.sceneAabbSurfaceArea);
+
+        atomicAdd(stats.leafSizeSum, leafSizeSum);
+        atomicMin(stats.leafSizeMin, leafSizeMin);
+        atomicMax(stats.leafSizeMax, leafSizeMax);
+    }
+}

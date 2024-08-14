@@ -1,0 +1,442 @@
+#version 460
+
+#extension GL_EXT_buffer_reference2: require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: require
+
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_EXT_shader_realtime_clock: require
+
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#extension GL_GOOGLE_include_directive : enable
+
+#define INCLUDE_FROM_SHADER
+#include "data_bvh.h"
+#include "data_scene.h"
+#include "data_types_general.glsl"
+
+// TODO: include based on volume used
+#include "bv_aabb.glsl"
+#include "bv_dop14.glsl"
+
+#include "bvh_compressed_binary.glsl"
+
+#include "random.glsl"
+#include "rayCommon.glsl"
+
+layout(set = 0, binding = 0, rgba32f) uniform image2D image;
+layout(set = 0, binding = 1) uniform Camera {
+    mat4 view;
+    mat4 projection;
+    mat4 viewInv;
+    mat4 projectionInv;
+} camera;
+layout(push_constant) uniform uPushConstant
+{
+    PC_PT data;
+    int depth;
+} pc;
+layout (local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+#define EPS 1e-5f
+#define INVALID_ID -1
+#define STACK_SIZE 64
+#define DYNAMIC_FETCH_THRESHOLD 20
+#define BOTTOM_OF_STACK 0x76543210
+
+#define MAX_DEPTH 7
+
+shared uint nextRay[gl_WorkGroupSize.y];
+
+
+void trace()
+{
+    bool anyHit = false;
+
+    
+            vec3 idir;
+            vec3 ood;
+            vec4 iDir_DOP;
+            vec4 ood_DOP;
+
+            BvhBinaryDOP14Compressed_SPLIT bvhSplit = BvhBinaryDOP14Compressed_SPLIT(pc.data.auxBufferAddress);
+        
+
+    uint stackId;
+    int traversalStack[STACK_SIZE];
+    int nodeDepthStack[STACK_SIZE];
+    int parentIdStack[STACK_SIZE];
+    float tStack[STACK_SIZE];
+
+    traversalStack[0] = BOTTOM_OF_STACK;
+    nodeDepthStack[0] = 0;
+    parentIdStack[0] = 0;
+    tStack[0] = 0.f;
+
+    int nodeId = BOTTOM_OF_STACK;
+    int leafId;
+    uint rayId;
+    float tmin;
+    vec3 origin, dir;
+
+    float t;
+    int nodeDepth;
+    int parentId;
+
+    RayTraceResult result;
+    uint traversedNodes;
+    uint testedTriangles;
+
+    Stats stats = Stats(pc.data.ptStatsAddress);
+    RayBufferMetadata_ref rayBufMeta = RayBufferMetadata_ref(pc.data.rayBufferMetadataAddress);
+    const bool useIdx0 = (rayBufMeta.data_0.depth_TMP % 2) == 0;
+    RayBuf rayBuffer = useIdx0 ? RayBuf(pc.data.rayBuffer0Address) : RayBuf(pc.data.rayBuffer1Address);
+    const uint rayCount = useIdx0 ? rayBufMeta.data_0.rayCount : rayBufMeta.data_1.rayCount;
+
+    BvhBinaryCompressed bvh = BvhBinaryCompressed(pc.data.bvhAddress);
+    BvhTriangles triangles = BvhTriangles(pc.data.bvhTrianglesAddress);
+    BvhTriangleIndices triangleIndices = BvhTriangleIndices(pc.data.bvhTriangleIndicesAddress);
+
+    while (true) {
+        const bool isTerminated = (nodeId == BOTTOM_OF_STACK);
+        const uvec4 ballot = subgroupBallot(isTerminated);
+        const uint terminatedCount = subgroupBallotBitCount(ballot);
+        const uint terminatedId = subgroupBallotExclusiveBitCount(ballot);
+
+        if (isTerminated) {
+            traversedNodes = 0;
+            testedTriangles = 0;
+
+            if (terminatedId == 0) {
+                if (useIdx0)
+                    nextRay[gl_SubgroupID] = atomicAdd(rayBufMeta.data_0.rayTracedCount, terminatedCount);
+                else
+                    nextRay[gl_SubgroupID] = atomicAdd(rayBufMeta.data_1.rayTracedCount, terminatedCount);
+            }
+            memoryBarrier(gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+
+            rayId = nextRay[gl_SubgroupID] + terminatedId;
+            if (rayId >= rayCount)
+                break;
+
+            const Ray ray = rayBuffer.ray[rayId];
+
+            origin = ray.o.xyz;
+            tmin = ray.o.w;
+            dir = ray.d.xyz;
+            result.t = ray.d.w;
+            t = result.t;
+
+            
+            idir.x = 1.f / (abs(ray.d.x) > EPS ? ray.d.x : EPS * sign(ray.d.x));
+            idir.y = 1.f / (abs(ray.d.y) > EPS ? ray.d.y : EPS * sign(ray.d.y));
+            idir.z = 1.f / (abs(ray.d.z) > EPS ? ray.d.z : EPS * sign(ray.d.z));
+            ood = origin * idir;
+
+            float dotResult = 0.f;
+            dotResult = dot_dop14_n3(dir);
+            iDir_DOP[0] = 1.f / (abs(dotResult) > EPS ? dotResult : EPS * sign(dotResult));
+            dotResult = dot_dop14_n4(dir);
+            iDir_DOP[1] = 1.f / (abs(dotResult) > EPS ? dotResult : EPS * sign(dotResult));
+            dotResult = dot_dop14_n5(dir);
+            iDir_DOP[2] = 1.f / (abs(dotResult) > EPS ? dotResult : EPS * sign(dotResult));
+            dotResult = dot_dop14_n6(dir);
+            iDir_DOP[3] = 1.f / (abs(dotResult) > EPS ? dotResult : EPS * sign(dotResult));
+
+            ood_DOP[0] = dot_dop14_n3(origin) * iDir_DOP[0];
+            ood_DOP[1] = dot_dop14_n4(origin) * iDir_DOP[1];
+            ood_DOP[2] = dot_dop14_n5(origin) * iDir_DOP[2];
+            ood_DOP[3] = dot_dop14_n6(origin) * iDir_DOP[3];
+        
+
+            stackId = 0;
+            leafId = 0;
+            nodeId = 0;
+
+            nodeDepth = 0;
+            parentId = 0;
+
+            result.instanceId = INVALID_ID;
+            result.primitiveId = INVALID_ID;
+            result.bvIntersectionCount = 0;
+            result.u = -1.f;
+            result.v = -1.f;
+        }
+
+        while (nodeId != BOTTOM_OF_STACK)
+        {
+            if (pc.depth == 0)
+                nodeDepth = -1;
+            // skip the traversal of this branch
+            if (nodeDepth == pc.depth || nodeId < 0) {
+                nodeId = traversalStack[stackId];
+                nodeDepth = nodeDepthStack[stackId];
+                parentId = parentIdStack[stackId];
+                t = tStack[stackId];
+                --stackId;
+                continue;
+            }
+
+            
+            vec4 n0xy = vec4(bvh.node[nodeId].bv[0], bvh.node[nodeId].bv[1], bvh.node[nodeId].bv[2], bvh.node[nodeId].bv[3]);
+            vec4 n1xy = vec4(bvh.node[nodeId].bv[4], bvh.node[nodeId].bv[5], bvh.node[nodeId].bv[6], bvh.node[nodeId].bv[7]);
+            vec4 nz = vec4(bvh.node[nodeId].bv[8], bvh.node[nodeId].bv[9], bvh.node[nodeId].bv[10], bvh.node[nodeId].bv[11]);
+
+            if (pc.depth == 0) {
+                n0xy.x = min(n0xy.x, n1xy.x);
+                n0xy.y = max(n0xy.y, n1xy.y);
+                n0xy.z = min(n0xy.z, n1xy.z);
+                n0xy.w = max(n0xy.w, n1xy.w);
+                nz.x = min(nz.x, nz.z);
+                nz.y = max(nz.y, nz.w);
+            }
+
+            ivec2 cnodes = ivec2(bvh.node[nodeId].c0, bvh.node[nodeId].c1);
+
+            const float c0lox = n0xy.x * idir.x - ood.x;
+            const float c0hix = n0xy.y * idir.x - ood.x;
+            const float c0loy = n0xy.z * idir.y - ood.y;
+            const float c0hiy = n0xy.w * idir.y - ood.y;
+            const float c0loz = nz.x   * idir.z - ood.z;
+            const float c0hiz = nz.y   * idir.z - ood.z;
+            const float c1loz = nz.z   * idir.z - ood.z;
+            const float c1hiz = nz.w   * idir.z - ood.z;
+
+            float c0min = max(max(min(c0lox, c0hix), min(c0loy, c0hiy)), max(min(c0loz, c0hiz), tmin));
+            float c0max = min(min(max(c0lox, c0hix), max(c0loy, c0hiy)), min(max(c0loz, c0hiz), result.t));
+
+            const float c1lox = n1xy.x * idir.x - ood.x;
+            const float c1hix = n1xy.y * idir.x - ood.x;
+            const float c1loy = n1xy.z * idir.y - ood.y;
+            const float c1hiy = n1xy.w * idir.y - ood.y;
+
+            float c1min = max(max(min(c1lox, c1hix), min(c1loy, c1hiy)), max(min(c1loz, c1hiz), tmin));
+            float c1max = min(min(max(c1lox, c1hix), max(c1loy, c1hiy)), min(max(c1loz, c1hiz), result.t));
+
+            {
+                vec2 dop3 = vec2(bvhSplit.node[nodeId].bv[0], bvhSplit.node[nodeId].bv[1]);
+                vec2 dop4 = vec2(bvhSplit.node[nodeId].bv[2], bvhSplit.node[nodeId].bv[3]);
+                vec2 dop5 = vec2(bvhSplit.node[nodeId].bv[4], bvhSplit.node[nodeId].bv[5]);
+                vec2 dop6 = vec2(bvhSplit.node[nodeId].bv[6], bvhSplit.node[nodeId].bv[7]);
+                if (pc.depth == 0) {
+                    dop3.x = min(dop3.x, bvhSplit.node[nodeId].bv[8]);
+                    dop3.y = max(dop3.y, bvhSplit.node[nodeId].bv[9]);
+                    dop4.x = min(dop4.x, bvhSplit.node[nodeId].bv[10]);
+                    dop4.y = max(dop4.y, bvhSplit.node[nodeId].bv[11]);
+                    dop5.x = min(dop5.x, bvhSplit.node[nodeId].bv[12]);
+                    dop5.y = max(dop5.y, bvhSplit.node[nodeId].bv[13]);
+                    dop6.x = min(dop6.x, bvhSplit.node[nodeId].bv[14]);
+                    dop6.y = max(dop6.y, bvhSplit.node[nodeId].bv[15]);
+                }
+                const vec2 ts3 = dop3 * iDir_DOP[0] - ood_DOP[0];
+                const vec2 ts4 = dop4 * iDir_DOP[1] - ood_DOP[1];
+                const vec2 ts5 = dop5 * iDir_DOP[2] - ood_DOP[2];
+                const vec2 ts6 = dop6 * iDir_DOP[3] - ood_DOP[3];
+                c0min = max(c0min, max(max(min(ts3.x, ts3.y), min(ts4.x, ts4.y)), max(min(ts5.x, ts5.y), min(ts6.x, ts6.y))));
+                c0max = min(c0max, min(min(max(ts3.x, ts3.y), max(ts4.x, ts4.y)), min(max(ts5.x, ts5.y), max(ts6.x, ts6.y))));
+            }
+            {
+                const vec2 dop3 = vec2(bvhSplit.node[nodeId].bv[8], bvhSplit.node[nodeId].bv[9]);
+                const vec2 ts3 = dop3 * iDir_DOP[0] - ood_DOP[0];
+                const vec2 dop4 = vec2(bvhSplit.node[nodeId].bv[10], bvhSplit.node[nodeId].bv[11]);
+                const vec2 ts4 = dop4 * iDir_DOP[1] - ood_DOP[1];
+                const vec2 dop5 = vec2(bvhSplit.node[nodeId].bv[12], bvhSplit.node[nodeId].bv[13]);
+                const vec2 ts5 = dop5 * iDir_DOP[2] - ood_DOP[2];
+                const vec2 dop6 = vec2(bvhSplit.node[nodeId].bv[14], bvhSplit.node[nodeId].bv[15]);
+                const vec2 ts6 = dop6 * iDir_DOP[3] - ood_DOP[3];
+                c1min = max(c1min, max(max(min(ts3.x, ts3.y), min(ts4.x, ts4.y)), max(min(ts5.x, ts5.y), min(ts6.x, ts6.y))));
+                c1max = min(c1max, min(min(max(ts3.x, ts3.y), max(ts4.x, ts4.y)), min(max(ts5.x, ts5.y), max(ts6.x, ts6.y))));
+            }
+
+
+            const bool swp = (c1min < c0min);
+            const bool traverseC0 = (c0max >= c0min);
+            const bool traverseC1 = (c1max >= c1min);
+        
+
+            if (!traverseC0 && !traverseC1) {
+                nodeId = traversalStack[stackId];
+                nodeDepth = nodeDepthStack[stackId];
+                parentId = parentIdStack[stackId];
+                t = tStack[stackId];
+                --stackId;
+
+                if (pc.depth == 0)
+                    nodeDepth = -1;
+            }
+            else {
+                parentId = nodeId;
+                nodeId = (traverseC0) ? cnodes.x : cnodes.y;
+                t = (traverseC0) ? c0min : c1min;
+                nodeDepth = nodeDepth + 1;
+
+                if (traverseC0 && traverseC1) {
+                    if (swp) {
+                        nodeId = cnodes.y;
+                        cnodes.y = cnodes.x;
+
+                        t = c1min;
+                        c1min = c0min;
+                    }
+                    ++stackId;
+                    traversalStack[stackId] = cnodes.y;
+                    nodeDepthStack[stackId] = nodeDepth;
+                    parentIdStack[stackId] = parentId;
+                    tStack[stackId] = c1min;
+                }
+            }
+
+            // record the closest hit
+            if (nodeDepth == pc.depth || nodeId < 0) {
+                result.t = min(result.t, t);
+                if (result.t == t) {
+                    int myNodeId = nodeId;
+                    nodeId = parentId;
+
+                    
+            vec4 n0xy = vec4(bvh.node[nodeId].bv[0], bvh.node[nodeId].bv[1], bvh.node[nodeId].bv[2], bvh.node[nodeId].bv[3]);
+            vec4 n1xy = vec4(bvh.node[nodeId].bv[4], bvh.node[nodeId].bv[5], bvh.node[nodeId].bv[6], bvh.node[nodeId].bv[7]);
+            vec4 nz = vec4(bvh.node[nodeId].bv[8], bvh.node[nodeId].bv[9], bvh.node[nodeId].bv[10], bvh.node[nodeId].bv[11]);
+
+            if (pc.depth == 0) {
+                n0xy.x = min(n0xy.x, n1xy.x);
+                n0xy.y = max(n0xy.y, n1xy.y);
+                n0xy.z = min(n0xy.z, n1xy.z);
+                n0xy.w = max(n0xy.w, n1xy.w);
+                nz.x = min(nz.x, nz.z);
+                nz.y = max(nz.y, nz.w);
+            }
+
+            ivec2 cnodes = ivec2(bvh.node[nodeId].c0, bvh.node[nodeId].c1);
+
+            const float c0lox = n0xy.x * idir.x - ood.x;
+            const float c0hix = n0xy.y * idir.x - ood.x;
+            const float c0loy = n0xy.z * idir.y - ood.y;
+            const float c0hiy = n0xy.w * idir.y - ood.y;
+            const float c0loz = nz.x   * idir.z - ood.z;
+            const float c0hiz = nz.y   * idir.z - ood.z;
+            const float c1loz = nz.z   * idir.z - ood.z;
+            const float c1hiz = nz.w   * idir.z - ood.z;
+
+            float c0min = max(max(min(c0lox, c0hix), min(c0loy, c0hiy)), max(min(c0loz, c0hiz), tmin));
+            float c0max = min(min(max(c0lox, c0hix), max(c0loy, c0hiy)), min(max(c0loz, c0hiz), result.t));
+
+            const float c1lox = n1xy.x * idir.x - ood.x;
+            const float c1hix = n1xy.y * idir.x - ood.x;
+            const float c1loy = n1xy.z * idir.y - ood.y;
+            const float c1hiy = n1xy.w * idir.y - ood.y;
+
+            float c1min = max(max(min(c1lox, c1hix), min(c1loy, c1hiy)), max(min(c1loz, c1hiz), tmin));
+            float c1max = min(min(max(c1lox, c1hix), max(c1loy, c1hiy)), min(max(c1loz, c1hiz), result.t));
+
+            vec2 dop3 = vec2(bvhSplit.node[nodeId].bv[0], bvhSplit.node[nodeId].bv[1]);
+            vec2 dop4 = vec2(bvhSplit.node[nodeId].bv[2], bvhSplit.node[nodeId].bv[3]);
+            vec2 dop5 = vec2(bvhSplit.node[nodeId].bv[4], bvhSplit.node[nodeId].bv[5]);
+            vec2 dop6 = vec2(bvhSplit.node[nodeId].bv[6], bvhSplit.node[nodeId].bv[7]);
+
+            if (pc.depth == 0) {
+                dop3.x = min(dop3.x, bvhSplit.node[nodeId].bv[8]);
+                dop3.y = max(dop3.y, bvhSplit.node[nodeId].bv[9]);
+                dop4.x = min(dop4.x, bvhSplit.node[nodeId].bv[10]);
+                dop4.y = max(dop4.y, bvhSplit.node[nodeId].bv[11]);
+                dop5.x = min(dop5.x, bvhSplit.node[nodeId].bv[12]);
+                dop5.y = max(dop5.y, bvhSplit.node[nodeId].bv[13]);
+                dop6.x = min(dop6.x, bvhSplit.node[nodeId].bv[14]);
+                dop6.y = max(dop6.y, bvhSplit.node[nodeId].bv[15]);
+            }
+            const vec2 ts3 = dop3 * iDir_DOP[0] - ood_DOP[0];
+            const vec2 ts4 = dop4 * iDir_DOP[1] - ood_DOP[1];
+            const vec2 ts5 = dop5 * iDir_DOP[2] - ood_DOP[2];
+            const vec2 ts6 = dop6 * iDir_DOP[3] - ood_DOP[3];
+
+            c0min = max(c0min, max(max(min(ts3.x, ts3.y), min(ts4.x, ts4.y)), max(min(ts5.x, ts5.y), min(ts6.x, ts6.y))));
+            c0max = min(c0max, min(min(max(ts3.x, ts3.y), max(ts4.x, ts4.y)), min(max(ts5.x, ts5.y), max(ts6.x, ts6.y))));
+
+            const vec2 dop3_1 = vec2(bvhSplit.node[nodeId].bv[8], bvhSplit.node[nodeId].bv[9]);
+            const vec2 ts3_1 = dop3_1 * iDir_DOP[0] - ood_DOP[0];
+            const vec2 dop4_1 = vec2(bvhSplit.node[nodeId].bv[10], bvhSplit.node[nodeId].bv[11]);
+            const vec2 ts4_1 = dop4_1 * iDir_DOP[1] - ood_DOP[1];
+            const vec2 dop5_1 = vec2(bvhSplit.node[nodeId].bv[12], bvhSplit.node[nodeId].bv[13]);
+            const vec2 ts5_1 = dop5_1 * iDir_DOP[2] - ood_DOP[2];
+            const vec2 dop6_1 = vec2(bvhSplit.node[nodeId].bv[14], bvhSplit.node[nodeId].bv[15]);
+            const vec2 ts6_1 = dop6_1 * iDir_DOP[3] - ood_DOP[3];
+            c1min = max(c1min, max(max(min(ts3_1.x, ts3_1.y), min(ts4_1.x, ts4_1.y)), max(min(ts5_1.x, ts5_1.y), min(ts6_1.x, ts6_1.y))));
+            c1max = min(c1max, min(min(max(ts3_1.x, ts3_1.y), max(ts4_1.x, ts4_1.y)), min(max(ts5_1.x, ts5_1.y), max(ts6_1.x, ts6_1.y))));
+
+            const bool swp = (c1min < c0min);
+            const bool traverseC0 = (c0max >= c0min);
+            const bool traverseC1 = (c1max >= c1min);
+            #define SQRT_3_INV .57735026919f
+
+            vec3 normal = vec3(0.f);
+            if (traverseC0) {
+                if (c0min == c0lox) normal = vec3(-1.f,  0.f,  0.f);
+                if (c0min == c0hix) normal = vec3( 1.f,  0.f,  0.f);
+                if (c0min == c0loy) normal = vec3( 0.f, -1.f,  0.f);
+                if (c0min == c0hiy) normal = vec3( 0.f,  1.f,  0.f);
+                if (c0min == c0loz) normal = vec3( 0.f,  0.f, -1.f);
+                if (c0min == c0hiz) normal = vec3( 0.f,  0.f,  1.f);
+                if (c0min == ts3.x) normal = vec3(-SQRT_3_INV, -SQRT_3_INV, -SQRT_3_INV);
+                if (c0min == ts3.y) normal = vec3( SQRT_3_INV,  SQRT_3_INV,  SQRT_3_INV);
+                if (c0min == ts4.x) normal = vec3(-SQRT_3_INV, -SQRT_3_INV,  SQRT_3_INV);
+                if (c0min == ts4.y) normal = vec3( SQRT_3_INV,  SQRT_3_INV, -SQRT_3_INV);
+                if (c0min == ts5.x) normal = vec3(-SQRT_3_INV,  SQRT_3_INV, -SQRT_3_INV);
+                if (c0min == ts5.y) normal = vec3( SQRT_3_INV, -SQRT_3_INV,  SQRT_3_INV);
+                if (c0min == ts6.x) normal = vec3(-SQRT_3_INV,  SQRT_3_INV,  SQRT_3_INV);
+                if (c0min == ts6.y) normal = vec3( SQRT_3_INV, -SQRT_3_INV, -SQRT_3_INV);
+            }
+            if (traverseC1 && (!traverseC0 || swp)) {
+                if (c1min == c1lox) normal = vec3(-1.f,  0.f,  0.f);
+                if (c1min == c1hix) normal = vec3( 1.f,  0.f,  0.f);
+                if (c1min == c1loy) normal = vec3( 0.f, -1.f,  0.f);
+                if (c1min == c1hiy) normal = vec3( 0.f,  1.f,  0.f);
+                if (c1min == c1loz) normal = vec3( 0.f,  0.f, -1.f);
+                if (c1min == c1hiz) normal = vec3( 0.f,  0.f,  1.f);
+                if (c1min == ts3_1.x) normal = vec3(-SQRT_3_INV, -SQRT_3_INV, -SQRT_3_INV);
+                if (c1min == ts3_1.y) normal = vec3( SQRT_3_INV,  SQRT_3_INV,  SQRT_3_INV);
+                if (c1min == ts4_1.x) normal = vec3(-SQRT_3_INV, -SQRT_3_INV,  SQRT_3_INV);
+                if (c1min == ts4_1.y) normal = vec3( SQRT_3_INV,  SQRT_3_INV, -SQRT_3_INV);
+                if (c1min == ts5_1.x) normal = vec3(-SQRT_3_INV,  SQRT_3_INV, -SQRT_3_INV);
+                if (c1min == ts5_1.y) normal = vec3( SQRT_3_INV, -SQRT_3_INV,  SQRT_3_INV);
+                if (c1min == ts6_1.x) normal = vec3(-SQRT_3_INV,  SQRT_3_INV,  SQRT_3_INV);
+                if (c1min == ts6_1.y) normal = vec3( SQRT_3_INV, -SQRT_3_INV, -SQRT_3_INV);
+            }
+        
+
+                    result.instanceId = myNodeId;
+                    result.primitiveId = floatBitsToUint(normal.x);
+                    result.u = normal.y;
+                    result.v = normal.z;
+
+                    nodeId = myNodeId;
+                }
+            }
+        }
+
+        RayTraceResultBuf results = RayTraceResultBuf(pc.data.rayTraceResultAddress);
+        results.result[rayId] = result;
+    }
+}
+
+
+
+void main()
+{
+    Stats stats = Stats(pc.data.ptStatsAddress);
+    RayBufferMetadata_ref rayBufMeta = RayBufferMetadata_ref(pc.data.rayBufferMetadataAddress);
+
+    if (gl_LocalInvocationIndex == 0)
+        atomicMin(stats.data.timerStart, clockRealtimeEXT());
+
+    trace();
+
+    barrier();
+    if (gl_LocalInvocationIndex == 0)
+        atomicMax(stats.data.times[rayBufMeta.data_0.depth_TMP].timer, (clockRealtimeEXT() - stats.data.timerStart));
+}
+    

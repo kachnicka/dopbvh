@@ -1,0 +1,28 @@
+[submodule "extern/glfw"]
+	path = extern/glfw
+	url = ../../glfw/glfw.git
+[submodule "extern/spdlog"]
+	path = extern/spdlog
+	url = ../../gabime/spdlog.git
+[submodule "extern/imgui/imgui"]
+	path = extern/imgui/imgui
+	url = ../../ocornut/imgui.git
+	branch = docking
+[submodule "extern/assimp"]
+	path = extern/assimp
+	url = ../../assimp/assimp.git
+[submodule "extern/glm"]
+	path = extern/glm
+	url = ../../g-truc/glm.git
+[submodule "extern/taskflow"]
+	path = extern/taskflow
+	url = ../../taskflow/taskflow.git
+[submodule "extern/freetype"]
+	path = extern/freetype
+	url = ../../freetype/freetype
+[submodule "extern/zlib-ng"]
+	path = extern/zlib-ng
+	url = ../../zlib-ng/zlib-ng.git
+[submodule "extern/tomlplusplus"]
+	path = extern/tomlplusplus
+	url = ../../marzer/tomlplusplus.git

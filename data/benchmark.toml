@@ -1,0 +1,91 @@
+[default]
+# [aabb, dop14, obb]
+plocpp.bv = "aabb"
+# [morton32]
+plocpp.space_filling = "morton32"
+# up to 128
+plocpp.radius = 16
+
+# [aabb, dop14, obb]
+collapsing.bv = "aabb"
+# up to 15
+collapsing.max_leaf_size = 15
+# SAH constants for collapsing
+collapsing.c_t = 3.0
+collapsing.c_i = 2.0
+
+# [aabb, dop14, obb]
+transformation.bv = ""
+
+# [aabb, dop14, obb]
+compression.bv = "aabb"
+# [binary_standard, binary_dop14_split]
+compression.layout = "binary_standard"
+
+# [aabb, dop14, obb]
+stats.bv = ""
+# SAH constants for reported cost
+stats.c_t = 3.0
+stats.c_i = 2.0
+
+# [aabb, dop14, obb]
+tracer.bv = "aabb"
+# persistent threads for the BVH traversal
+tracer.workgroup_count = 512
+tracer.use_separate_kernels = false
+
+# automated benchmarking, averaging all available views for each scene
+benchmark_scenes = ["tree", "hairball"]
+benchmark_config = ["AABB", "->DOP14s", "DOP14s"]
+
+[[benchmark]]
+name = "AABB"
+
+[[benchmark]]
+name = "->OBB"
+parent = "AABB"
+collapsing.c_t = 4.5
+stats.c_t = 4.5
+transformation.bv = "obb"
+compression.bv = "obb"
+tracer.bv = "obb"
+tracer.workgroup_count = 768
+
+[[benchmark]]
+name = "->DOP14"
+parent = "AABB"
+transformation.bv = "dop14"
+compression.bv = "dop14"
+collapsing.c_t = 4.5
+stats.c_t = 4.5
+tracer.bv = "dop14"
+
+[[benchmark]]
+name = "->DOP14s"
+parent = "->DOP14"
+compression.layout = "binary_dop14_split"
+
+[[benchmark]]
+name = "DOP14"
+plocpp.bv = "dop14"
+collapsing.bv = "dop14"
+collapsing.c_t = 4.5
+stats.c_t = 4.5
+compression.bv = "dop14"
+tracer.bv = "dop14"
+
+[[benchmark]]
+parent = "DOP14"
+name = "DOP14s"
+compression.layout = "binary_dop14_split"
+#collapsing.max_leaf_size = 8
+#plocpp.radius = 32
+
+[[benchmark]]
+parent = "DOP14"
+name = "d->OBB"
+transformation.bv = "obb"
+compression.bv = "obb"
+tracer.bv = "obb"
+tracer.workgroup_count = 768
+

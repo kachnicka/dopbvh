@@ -1,0 +1,166 @@
+#version 460
+
+#extension GL_EXT_buffer_reference2: require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: require
+#extension GL_KHR_memory_scope_semantics : require
+
+#extension GL_GOOGLE_include_directive : enable
+
+#define INCLUDE_FROM_SHADER
+#include "data_bvh.h"
+#include "data_plocpp.h"
+#include "bvh_compressed_binary.glsl"
+
+#include "bv_dop14.glsl"
+
+layout(local_size_x_id = 0) in;
+layout (push_constant) uniform uPushConstant{
+    uint64_t bvhAddress;
+    uint64_t bvhCompressedAddress;
+    uint64_t bvhCompressedAuxAddress;
+
+    uint64_t schedulerDataAddress;
+    uint64_t runtimeDataAddress;
+
+    uint64_t auxBufferAddress;
+    uint nodeCount;
+} pc;
+
+#include "taskScheduler.glsl"
+
+layout (buffer_reference, scalar) buffer RuntimeData {
+    uint idToProcessStart;
+    uint idToProcessEnd;
+    uint idToAssign;
+};
+
+#define INVALID_ID -1
+
+uint divCeil(in uint a, in uint b)
+{
+    return (a + b - 1) / b;
+}
+
+void compressBvhNodes(in uint taskId)
+{
+    BvhBinary bvh = BvhBinary(pc.bvhAddress);
+    BvhBinaryCompressed bvhCompressed = BvhBinaryCompressed(pc.bvhCompressedAddress);
+    RuntimeData rt = RuntimeData(pc.runtimeDataAddress);
+
+    int32_t bvhNodeId = int32_t(rt.idToProcessStart + taskId * gl_WorkGroupSize.x + gl_LocalInvocationID.x);
+    if (bvhNodeId >= rt.idToProcessEnd)
+        return;
+
+    NodeBvhBinaryCompressed node = bvhCompressed.node[bvhNodeId];
+    if (node.size > 0) {
+        // finish current node
+        float sa0 = bvArea(bvh.node[abs(node.c0)].bv);
+        float sa1 = bvArea(bvh.node[abs(node.c1)].bv);
+        if (sa1 > sa0) {
+            int32_t tmp = node.c0;
+            node.c0 = node.c1;
+            node.c1 = tmp;
+        }
+
+        
+        setBoxC0(bvhCompressed.node[bvhNodeId], bvh.node[abs(node.c0)].bv);
+        setBoxC1(bvhCompressed.node[bvhNodeId], bvh.node[abs(node.c1)].bv);
+
+
+        int32_t nonLeafChildCount = 0;
+        if (node.c0 > 0)
+            nonLeafChildCount++;
+        else {
+            // encode leaf size and tri address to child field, size has to fit sign bit and threshold used by collapsing kernel
+            // sign (isLeafFlag) : 1; leafSize : 4; triAddress : 27;
+            NodeBvhBinary cNode = bvh.node[-node.c0];
+            bvhCompressed.node[bvhNodeId].c0 = -((cNode.size & 0xF) << 27) | cNode.c0;
+        }
+
+        if (node.c1 > 0)
+            nonLeafChildCount++;
+        else {
+            // encode leaf size and tri address to child field, size has to fit sign bit and threshold used by collapsing kernel
+            // sign : 1; leafSize : 3; triAddress : 28;
+            NodeBvhBinary cNode = bvh.node[-node.c1];
+            bvhCompressed.node[bvhNodeId].c1 = -((cNode.size & 0xF) << 27) | cNode.c0;
+        }
+
+        if (nonLeafChildCount == 0)
+        return;
+
+        // prepare child nodes
+        // subtract one for easy index assignment by increment
+        int32_t newChildId = int32_t(atomicAdd(rt.idToAssign, nonLeafChildCount)) - 1;
+
+        if (node.c0 > 0) {
+            int32_t myId = ++newChildId;
+            bvhCompressed.node[bvhNodeId].c0 = myId;
+
+            bvhCompressed.node[myId].parent = bvhNodeId;
+            bvhCompressed.node[myId].c0 = bvh.node[abs(node.c0)].c0;
+            bvhCompressed.node[myId].c1 = bvh.node[abs(node.c0)].c1;
+            bvhCompressed.node[myId].size = bvh.node[abs(node.c0)].size;
+        }
+
+        if (node.c1 > 0) {
+            int32_t myId = ++newChildId;
+            bvhCompressed.node[bvhNodeId].c1 = myId;
+
+            bvhCompressed.node[myId].parent = bvhNodeId;
+            bvhCompressed.node[myId].c0 = bvh.node[abs(node.c1)].c0;
+            bvhCompressed.node[myId].c1 = bvh.node[abs(node.c1)].c1;
+            bvhCompressed.node[myId].size = bvh.node[abs(node.c1)].size;
+        }
+    }
+}
+
+#define COMPRESSION_PHASE 1
+#define COMPRESSION_DONE 0
+
+void main()
+{
+    BvhBinary bvh = BvhBinary(pc.bvhAddress);
+    BvhBinaryCompressed bvhCompressed = BvhBinaryCompressed(pc.bvhCompressedAddress);
+    RuntimeData rt = RuntimeData(pc.runtimeDataAddress);
+
+    if (gl_GlobalInvocationID.x == 0) {
+        // prepare the BVH root node
+        uint oldRootNodeId = pc.nodeCount - 1;
+        bvhCompressed.node[0].parent = INVALID_ID;
+        bvhCompressed.node[0].c0 = bvh.node[oldRootNodeId].c0;
+        bvhCompressed.node[0].c1 = bvh.node[oldRootNodeId].c1;
+        bvhCompressed.node[0].size = bvh.node[oldRootNodeId].size;
+
+        // setup the root node processing
+        rt.idToProcessStart = 0;
+        rt.idToProcessEnd = 1;
+        rt.idToAssign = 1;
+        allocTasks(1, COMPRESSION_PHASE);
+    }
+
+    while (true) {
+        Task task = beginTask(gl_LocalInvocationID.x);
+
+        switch (task.phase) {
+        case COMPRESSION_PHASE:
+            compressBvhNodes(task.id);
+
+            if (endTask(gl_LocalInvocationID.x)) {
+                rt.idToProcessStart = rt.idToProcessEnd;
+                rt.idToProcessEnd = rt.idToAssign;
+                uint nextBvhLevelNodeCount = rt.idToProcessEnd - rt.idToProcessStart;
+
+                if (nextBvhLevelNodeCount == 0)
+                    allocTasks(gl_NumWorkGroups.x, COMPRESSION_DONE);
+                else
+                    allocTasks(divCeil(nextBvhLevelNodeCount, 1024), COMPRESSION_PHASE);
+            }
+            break;
+        case COMPRESSION_DONE:
+            return;
+        }
+    };
+}

@@ -1,0 +1,114 @@
+#version 460
+
+#extension GL_EXT_buffer_reference2: require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: require
+
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_atomic_float : require
+
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_EXT_shader_realtime_clock: require
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#extension GL_GOOGLE_include_directive : enable
+
+#include "bv_aabb.glsl"
+#define INCLUDE_FROM_SHADER
+#include "data_bvh.h"
+#include "data_plocpp.h"
+#include "data_scene.h"
+
+#include "bvh_compressed_binary.glsl"
+#include "bv_dop14.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout (push_constant) uniform uPushConstant{
+    PC_TransformToDOP data;
+} pc;
+
+#define INVALID_ID -1
+
+void transform(in uint taskId)
+{
+    uint nodeId = taskId * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (nodeId >= pc.data.leafNodeCount)
+        return;
+
+    BvhBinary bvh = BvhBinary(pc.data.bvhAddress);
+    BvhTriangleIndices triangleIndices = BvhTriangleIndices(pc.data.bvhTriangleIndicesAddress);
+    u32Buf counter = u32Buf(pc.data.countersAddress);
+    GeometryDescriptor gDesc = GeometryDescriptor(pc.data.geometryDescriptorAddress);
+
+    BvhBinaryDOP14 bvhDOP = BvhBinaryDOP14(pc.data.bvhDOPAddress);
+
+    // AABB leaf node to DOP14 leaf node, fetch the trianle
+    float dop[14] = dopInit();
+    NodeBvhBinary node = bvh.node[nodeId];
+    bvhDOP.node[nodeId].size = node.size;
+    bvhDOP.node[nodeId].parent = node.parent;
+    bvhDOP.node[nodeId].c0 = node.c0;
+    bvhDOP.node[nodeId].c1 = node.c1;
+
+    int triStartId = node.c0;
+    int triCount = -node.size;
+
+    // for noncollapsed nodes
+//    triStartId = int(nodeId);
+//    triCount = 1;
+
+    for (int triId = triStartId; triId < triStartId + triCount; triId++) {
+        BvhTriangleIndex ids = triangleIndices.val[triId];
+
+        Geometry g = gDesc.g[ids.nodeId];
+        uvec3Buf indices = uvec3Buf(g.idxAddress);
+        fvec3Buf vertices = fvec3Buf(g.vtxAddress);
+
+        const uvec3 idx = indices.val[ids.triangleId];
+        bvFit(dop, vertices.val[idx.x]);
+        bvFit(dop, vertices.val[idx.y]);
+        bvFit(dop, vertices.val[idx.z]);
+    }
+
+    bvhDOP.node[nodeId].bv = dop;
+
+    int cId = int(nodeId);
+    nodeId = node.parent;
+    while (atomicAdd(counter.val[nodeId], 1) > 0)
+    {
+        node = bvh.node[nodeId];
+        bvhDOP.node[nodeId].size = node.size;
+        bvhDOP.node[nodeId].parent = node.parent;
+        bvhDOP.node[nodeId].c0 = node.c0;
+        bvhDOP.node[nodeId].c1 = node.c1;
+
+        int nodeIdToLoad;
+        if (cId == abs(node.c0))
+            nodeIdToLoad = abs(node.c1);
+        else
+            nodeIdToLoad = abs(node.c0);
+        float cDop[14];
+        cDop = bvhDOP.node[nodeIdToLoad].bv;
+        bvFit(dop, cDop);
+
+        bvFit(dop, cDop);
+        bvhDOP.node[nodeId].bv = dop;
+        memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
+
+        cId = int(nodeId);
+        nodeId = node.parent;
+        if (nodeId == INVALID_ID)
+            return;
+    }
+}
+
+void main()
+{
+    transform(gl_WorkGroupID.x);
+}

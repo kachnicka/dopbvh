@@ -1,0 +1,264 @@
+#version 460
+
+#extension GL_EXT_buffer_reference2: require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: require
+#extension GL_EXT_shader_atomic_int64: require
+
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const uint32_t SC_subgroupSize = 32u;
+layout(constant_id = 2) const uint32_t SC_plocRadius = 16u;
+
+#extension GL_GOOGLE_include_directive : enable
+
+#define INCLUDE_FROM_SHADER
+#include "data_bvh.h"
+#include "data_plocpp.h"
+
+#include "bv_aabb.glsl"
+
+layout (push_constant, scalar) uniform uPushConstant {
+    PC_PlocppIteration data;
+} pc;
+
+#define SCHEDULER_DATA_ADDRESS pc.data.runtimeDataAddress
+#include "taskScheduler.glsl"
+
+layout (buffer_reference, scalar) buffer RuntimeData { Scheduler sched; PLOCData ploc; };
+
+#define INVALID_ID -1
+
+const uint32_t SC_subgroupCount = gl_WorkGroupSize.x / SC_subgroupSize;
+const uint32_t SC_chunkSize = gl_WorkGroupSize.x - 4u * SC_plocRadius;
+const uint32_t SC_twoPlocRadius = 2u * SC_plocRadius;
+
+uint divCeil(in uint a, in uint b)
+{
+    return (a + b - 1) / b;
+}
+
+shared Aabb cache[gl_WorkGroupSize.x];
+shared uint64_t nn[gl_WorkGroupSize.x];
+
+shared uint32_t sharedPrefix;
+shared uint32_t sharedAggregate;
+shared uint32_t validIdsInSubgroup[SC_subgroupCount];
+
+shared uint32_t sharedClusterCount;
+shared uint32_t sharedTaskCount;
+
+void merge(in uint32_t chunkId, in uint32_t clusterCount) {
+    BvhBinary bvh = BvhBinary (pc.data.bvhAddress);
+
+    u32Buf nodeId0 = u32Buf(pc.data.nodeId0Address);
+    u32Buf nodeId1 = u32Buf(pc.data.nodeId1Address);
+    DLWorkBuf dlWork = DLWorkBuf(pc.data.dlWorkBufAddress);
+    RuntimeData data = RuntimeData(pc.data.runtimeDataAddress);
+
+    if (gl_LocalInvocationID.x == 0)
+        sharedAggregate = 0;
+    barrier();
+
+    const uint32_t myChunkIdOffset = chunkId * SC_chunkSize;
+    const uint32_t memoryIdLocal = gl_LocalInvocationID.x;
+    const uint32_t memoryIdGlobal = memoryIdLocal + myChunkIdOffset - SC_twoPlocRadius;
+    const uint32_t myClusterCount = min(SC_chunkSize, clusterCount - myChunkIdOffset);
+    uint32_t myNodeId = INVALID_ID;
+
+    // load clusters to shared memory, first SC_twoPlocRadius invocations
+    // will overflow the uint32_t and correctly load the dummy bounding volume
+    if (memoryIdLocal < (myClusterCount + 4 * SC_plocRadius)) {
+        nn[memoryIdLocal] = INVALID_ID;
+        if (memoryIdGlobal >= clusterCount)
+            cache[memoryIdLocal] = aabbDummy();
+        else {
+            myNodeId = nodeId0.val[memoryIdGlobal];
+            cache[memoryIdLocal] = bvh.node[myNodeId].bv;
+        }
+    }
+    barrier();
+
+    // find nearest neighbours
+    if (memoryIdLocal < (myClusterCount + 3 * SC_plocRadius)) {
+        uint64_t minValue = INVALID_ID;
+        Aabb myBv = cache[memoryIdLocal];
+        for (uint32_t cnt = 0; cnt < SC_plocRadius; cnt++) {
+            uint32_t cacheId = memoryIdLocal + cnt + 1;
+            Aabb neighborBv = cache[cacheId];
+            bvFit(neighborBv, myBv);
+
+            uint64_t encoded = (uint64_t(floatBitsToUint(bvArea(neighborBv))) << 32);
+            minValue = min(minValue, encoded | (cacheId));
+            atomicMin(nn[cacheId], encoded | (memoryIdLocal));
+        }
+        atomicMin(nn[memoryIdLocal], minValue);
+    }
+    barrier();
+
+    // merge corresponding NNs
+    if ((memoryIdLocal >= SC_twoPlocRadius) && (memoryIdLocal < (myClusterCount + SC_twoPlocRadius))) {
+        uint32_t myNeighbour = uint32_t(nn[memoryIdLocal]);
+        uint32_t hisNeighbour = uint32_t(nn[myNeighbour]);
+        bool isValidId = true;
+
+        if (memoryIdLocal == hisNeighbour) {
+            if (memoryIdLocal < myNeighbour) {
+                const uvec4 ballot = subgroupBallot(true);
+                uint32_t mergedId;
+                if (subgroupElect())
+                    mergedId = atomicAdd(data.ploc.bvOffset, subgroupBallotBitCount(ballot));
+                mergedId = subgroupBroadcastFirst(mergedId) + subgroupBallotExclusiveBitCount(ballot);
+
+                const uint32_t rightNodeId = nodeId0.val[memoryIdGlobal + (myNeighbour - hisNeighbour)];
+
+                Aabb bvC0 = cache[memoryIdLocal];
+                Aabb bvC1 = cache[myNeighbour];
+                bvFit(bvC0, bvC1);
+
+                int32_t size = bvh.node[myNodeId].size + bvh.node[rightNodeId].size;
+                bvh.node[myNodeId].parent = int32_t(mergedId);
+                bvh.node[rightNodeId].parent = int32_t(mergedId);
+                bvh.node[mergedId].bv = bvC0;
+                bvh.node[mergedId].size = size;
+                bvh.node[mergedId].parent = INVALID_ID;
+                bvh.node[mergedId].c0 = int32_t(myNodeId);
+                bvh.node[mergedId].c1 = int32_t(rightNodeId);
+
+                nodeId1.val[memoryIdGlobal] = mergedId;
+                nodeId1.val[memoryIdGlobal + (myNeighbour - hisNeighbour)] = INVALID_ID;
+            }
+            else
+                isValidId = false;
+        }
+        else
+            nodeId1.val[memoryIdGlobal] = myNodeId;
+
+        const uvec4 ballot = subgroupBallot(isValidId);
+        if (subgroupElect())
+            atomicAdd(sharedAggregate, subgroupBallotBitCount(ballot));
+    }
+    barrier();
+
+    if (memoryIdLocal == SC_twoPlocRadius) {
+        dlWork.val[chunkId].aggregate = sharedAggregate;
+        dlWork.val[chunkId].prefix = (chunkId == 0) ? sharedAggregate : INVALID_ID;
+    }
+}
+
+
+void compact(in uint32_t chunkId, in uint32_t clusterCount) {
+    u32Buf nodeId0 = u32Buf(pc.data.nodeId0Address);
+    u32Buf nodeId1 = u32Buf(pc.data.nodeId1Address);
+    DLWorkBuf dlWork = DLWorkBuf(pc.data.dlWorkBufAddress);
+
+    uint32_t myClusterCount = min(SC_chunkSize, clusterCount - chunkId * SC_chunkSize);
+    uint32_t memoryIdGlobal = chunkId * SC_chunkSize - SC_twoPlocRadius + gl_LocalInvocationID.x;
+    uint32_t memoryIdLocal = gl_LocalInvocationID.x;
+
+    if (gl_LocalInvocationID.x == 0)
+        sharedPrefix = 0;
+    if (gl_LocalInvocationID.x < SC_subgroupSize)
+        validIdsInSubgroup[gl_LocalInvocationID.x] = 0;
+    barrier();
+
+    if ((memoryIdLocal == SC_twoPlocRadius) && (chunkId > 0)) {
+        uint32_t lookbackPartitionId = chunkId - 1;
+        while (true) {
+            if (atomicLoad(dlWork.val[lookbackPartitionId].prefix, gl_ScopeDevice, gl_StorageSemanticsBuffer,
+            gl_SemanticsAcquire | gl_SemanticsMakeVisible) != INVALID_ID) {
+                atomicAdd(sharedPrefix, dlWork.val[lookbackPartitionId].prefix);
+                break;
+            }
+            else {
+                atomicAdd(sharedPrefix, dlWork.val[lookbackPartitionId].aggregate);
+                lookbackPartitionId--;
+            }
+        }
+        atomicStore(dlWork.val[chunkId].prefix, dlWork.val[chunkId].aggregate + sharedPrefix,
+                    gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease | gl_SemanticsMakeAvailable);
+    }
+    barrier();
+
+    // finalize the prefix sum computation and perform the ID compaction
+    uint32_t bvId;
+    uvec4 ballot;
+    if ((memoryIdLocal >= SC_twoPlocRadius) && (memoryIdLocal < (myClusterCount + SC_twoPlocRadius))) {
+        bvId = nodeId1.val[memoryIdGlobal];
+        ballot = subgroupBallot(bvId != INVALID_ID);
+        if (subgroupElect())
+            validIdsInSubgroup[gl_SubgroupID] = subgroupBallotBitCount(ballot);
+    }
+    barrier();
+    if (gl_LocalInvocationID.x < SC_subgroupSize)
+        validIdsInSubgroup[gl_LocalInvocationID.x] = sharedPrefix + subgroupExclusiveAdd(validIdsInSubgroup[gl_LocalInvocationID.x]);
+    barrier();
+    if ((memoryIdLocal >= SC_twoPlocRadius) && (memoryIdLocal < (myClusterCount + SC_twoPlocRadius))) {
+        if (bvId != INVALID_ID) {
+            uint32_t compactedId = validIdsInSubgroup[gl_SubgroupID] + subgroupBallotExclusiveBitCount(ballot);
+            nodeId0.val[compactedId] = bvId;
+        }
+    }
+}
+
+#define PLOC_PHASE_DONE 0
+#define PLOC_PHASE_MERGE 3
+#define PLOC_PHASE_COMPACT 4
+
+// each workgroup handles the PLOCpp chunk of the clusters
+// chunk represents also the decoupled lookback partition for prefix scan
+void main() {
+    DLWorkBuf dlWork = DLWorkBuf(pc.data.dlWorkBufAddress);
+    RuntimeData data = RuntimeData(pc.data.runtimeDataAddress);
+
+    if (gl_GlobalInvocationID.x == 0) {
+        data.ploc.bvOffset = pc.data.clusterCount;
+        uint32_t newTaskCount = divCeil(pc.data.clusterCount, SC_chunkSize);
+        data.ploc.iterationClusterCount = pc.data.clusterCount;
+        data.ploc.iterationTaskCount = newTaskCount;
+        allocTasks(newTaskCount, PLOC_PHASE_MERGE);
+    }
+
+    while (true) {
+        Task task = beginTask(gl_LocalInvocationID.x);
+        if (gl_LocalInvocationID.x == 0) {
+            sharedClusterCount = data.ploc.iterationClusterCount;
+            sharedTaskCount = data.ploc.iterationTaskCount;
+        }
+        barrier();
+
+        switch (task.phase) {
+            case PLOC_PHASE_MERGE:
+                merge(task.id, sharedClusterCount);
+
+                if (endTask(gl_LocalInvocationID.x)) {
+                    allocTasks(sharedTaskCount, PLOC_PHASE_COMPACT);
+                    data.ploc.iterationCounter++;
+                }
+                break;
+            case PLOC_PHASE_COMPACT:
+                compact(task.id, sharedClusterCount);
+
+                if (endTask(gl_LocalInvocationID.x)) {
+                    uint32_t newClusterCount = dlWork.val[sharedTaskCount - 1].prefix;
+                    uint32_t newTaskCount = divCeil(newClusterCount, SC_chunkSize);
+
+                    if (newClusterCount > 1) {
+                        data.ploc.iterationClusterCount = newClusterCount;
+                        data.ploc.iterationTaskCount = newTaskCount;
+                        allocTasks(newTaskCount, PLOC_PHASE_MERGE);
+                    }
+                    else
+                        allocTasks(gl_NumWorkGroups.x, PLOC_PHASE_DONE);
+                }
+                break;
+            case PLOC_PHASE_DONE:
+                return;
+        }
+    };
+}

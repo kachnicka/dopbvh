@@ -1,0 +1,103 @@
+#version 460
+
+#extension GL_EXT_buffer_reference2: require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: require
+
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_EXT_shader_realtime_clock: require
+
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#extension GL_GOOGLE_include_directive : enable
+
+#define INCLUDE_FROM_SHADER
+#include "data_bvh.h"
+#include "data_scene.h"
+#include "data_types_general.glsl"
+
+// TODO: include based on volume used
+#include "bv_aabb.glsl"
+#include "bv_dop14.glsl"
+
+#include "bvh_compressed_binary.glsl"
+
+#include "random.glsl"
+#include "rayCommon.glsl"
+
+layout(set = 0, binding = 0, rgba32f) uniform image2D image;
+layout(set = 0, binding = 1) uniform Camera {
+    mat4 view;
+    mat4 projection;
+    mat4 viewInv;
+    mat4 projectionInv;
+} camera;
+layout(push_constant) uniform uPushConstant
+{
+    PC_PT data;
+    
+} pc;
+layout (local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+void main()
+{
+    ivec2 imgSize = imageSize(image);
+
+    
+    ivec2 imgCoords = ivec2(gl_GlobalInvocationID.xy);
+    uvec2 tileId = gl_WorkGroupID.xy;
+    
+
+    if (imgCoords.x >= imgSize.x || imgCoords.y >= imgSize.y)
+        return;
+
+    uint seed = tea(imgCoords.y * imgSize.x + imgCoords.x, pc.data.samplesComputed);
+    // TODO: read correct sample id for accumulation
+    uint sampleId = pc.data.samplesComputed;
+    const vec2 subpixelJitter = sampleId == 0 ? vec2(.5f) : vec2(rnd(seed), rnd(seed));
+    const vec2 pixelCenter    = vec2(imgCoords) + subpixelJitter;
+    const vec2 inUV           = pixelCenter / vec2(imgSize.xy);
+    const vec2 d              = inUV * 2.f - 1.f;
+
+    Ray ray;
+    vec4 target = camera.projectionInv * vec4(d.x, d.y, 1.f, 1.f);
+    ray.o = camera.viewInv * vec4(0.f, 0.f, 0.f, 1.f);
+    ray.d = camera.viewInv * vec4(normalize(target.xyz), 0.f);
+
+    ray.o.w = .01f;
+    ray.d.w = BIG_FLOAT;
+
+    RayBuf rayBuffer = RayBuf(pc.data.rayBuffer0Address);
+    RayPayloadBuf rayPayload = RayPayloadBuf(pc.data.rayPayload0Address);
+
+    // maintaining a per tile ray coherence, likely can be improved by a Morton curve
+    const uint tileX = min(gl_WorkGroupSize.x, imgSize.x - tileId.x * gl_WorkGroupSize.x);
+    const uint tileY = min(gl_WorkGroupSize.y, imgSize.y - tileId.y * gl_WorkGroupSize.y);
+    const uint rowOffset = tileId.y * gl_WorkGroupSize.y * imgSize.x;
+    const uint colOffset = tileId.x * gl_WorkGroupSize.x * tileY;
+    //    const uint localOffset = gl_LocalInvocationID.y * tileX + gl_LocalInvocationID.x;
+    const uint localOffset = gl_LocalInvocationID.x * tileY + gl_LocalInvocationID.y;
+    const uint rayBufferOffset = rowOffset + colOffset + localOffset;
+
+    rayBuffer.ray[rayBufferOffset] = ray;
+    rayPayload.val[rayBufferOffset].packedPosition = imgCoords.x << 18 | imgCoords.y << 4 | RAY_TYPE_PRIMARY;
+    rayPayload.val[rayBufferOffset].seed = seed;
+    rayPayload.val[rayBufferOffset].throughput = vec3(1.f);
+
+    uint[3] padding = { 0, 0, 0 };
+    rayPayload.val[rayBufferOffset].padding = padding;
+
+    if (gl_GlobalInvocationID.x == 0 && gl_GlobalInvocationID.y == 0) {
+        RayBufferMetadata_ref rayBufMeta = RayBufferMetadata_ref(pc.data.rayBufferMetadataAddress);
+        rayBufMeta.data_0.rayCount = imgSize.x * imgSize.y;
+        rayBufMeta.data_0.rayTracedCount = 0;
+        rayBufMeta.data_0.depth_TMP = 0;
+        rayBufMeta.data_1.rayCount = 0;
+        rayBufMeta.data_1.rayTracedCount = 0;
+    }
+}
+    

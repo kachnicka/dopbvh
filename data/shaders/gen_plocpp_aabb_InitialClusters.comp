@@ -1,0 +1,73 @@
+#version 460
+
+#extension GL_EXT_buffer_reference2: require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: require
+
+layout(local_size_x_id = 0) in;
+
+#extension GL_GOOGLE_include_directive : enable
+
+#define INCLUDE_FROM_SHADER
+#include "data_bvh.h"
+#include "data_plocpp.h"
+#include "morton32.glsl"
+
+#include "bv_aabb.glsl"
+
+layout (push_constant, scalar) uniform uPushConstant {
+    PC_MortonGlobal global;
+    PC_MortonPerGeometry geometry;
+} pc;
+
+void computeMortonCodesAndInitClusters() {
+    if (gl_GlobalInvocationID.x >= pc.geometry.triangleCount)
+        return;
+
+    Morton32KeyVals outM32 = Morton32KeyVals(pc.global.mortonAddress);
+    BvhTriangles outTriangles = BvhTriangles(pc.global.bvhTrianglesAddress);
+    BvhTriangleIndices outTriangleIndices = BvhTriangleIndices(pc.global.bvhTriangleIndicesAddress);
+
+    uvec3Buf inIndices = uvec3Buf(pc.geometry.idxAddress);
+    fvec3Buf inVertices = fvec3Buf(pc.geometry.vtxAddress);
+
+    const uint32_t localTriangleId = gl_GlobalInvocationID.x;
+    const uint32_t globalTriangleId = pc.geometry.globalTriangleIdBase + localTriangleId;
+
+    const uvec3 idx = inIndices.val[localTriangleId];
+    const vec3 v0 = inVertices.val[idx.x];
+    const vec3 v1 = inVertices.val[idx.y];
+    const vec3 v2 = inVertices.val[idx.z];
+
+    
+Aabb triangleAabb = Aabb(v0, v0);
+bvFit(triangleAabb, v1);
+bvFit(triangleAabb, v2);
+
+BvhBinary bvh = BvhBinary(pc.global.bvhAddress);
+bvh.node[globalTriangleId] = NodeBvhBinary(triangleAabb, 1, INVALID_ID, INVALID_ID, INVALID_ID);
+
+vec3 bvCentroid = aabbCentroid(triangleAabb);
+
+
+    bvCentroid = (bvCentroid - pc.global.sceneAabbCubedMin) * pc.global.sceneAabbNormalizationScale;
+    outM32.keyval[globalTriangleId] = Morton32KeyVal(globalTriangleId, mortonCode32(bvCentroid));
+
+    // TODO: do this during the scene load to avoid recomputation during each bvh rebuild
+    mat4 matrix;
+    matrix[0] = vec4(v0 - v2, 0.0f);
+    matrix[1] = vec4(v1 - v2, 0.0f);
+    matrix[2] = vec4(cross(v0 - v2, v1 - v2), 0.0f);
+    matrix[3] = vec4(v2.x, v2.y, v2.z, 1.0f);
+    matrix = inverse(matrix);
+    vec4 v0Woopified = vec4(matrix[0][2], matrix[1][2], matrix[2][2], -matrix[3][2]);
+    vec4 v1Woopified = vec4(matrix[0][0], matrix[1][0], matrix[2][0], matrix[3][0]);
+    vec4 v2Woopified = vec4(matrix[0][1], matrix[1][1], matrix[2][1], matrix[3][1]);
+    outTriangles.t[globalTriangleId] = BvhTriangle(v0Woopified, v1Woopified, v2Woopified);
+    outTriangleIndices.val[globalTriangleId] = BvhTriangleIndex(pc.geometry.sceneNodeId, localTriangleId);
+}
+
+void main() {
+    computeMortonCodesAndInitClusters();
+}

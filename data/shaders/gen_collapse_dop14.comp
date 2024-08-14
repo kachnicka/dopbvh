@@ -1,0 +1,442 @@
+#version 460
+
+#extension GL_EXT_buffer_reference2: require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: require
+
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const uint32_t SC_subgroupSize = 32u;
+
+#extension GL_GOOGLE_include_directive : enable
+
+#define INCLUDE_FROM_SHADER
+#include "data_bvh.h"
+#include "data_plocpp.h"
+
+#include "bv_dop14.glsl"
+
+layout (push_constant) uniform uPushConstant{
+    uint64_t bvhAddress;
+    uint64_t bvhTrianglesAddress;
+    uint64_t bvhTriangleIndicesAddress;
+    uint64_t bvhCollapsedAddress;
+    uint64_t bvhCollapsedTrianglesAddress;
+    uint64_t bvhCollapsedTriangleIndicesAddress;
+
+    uint64_t counterAddress;
+    uint64_t nodeStateAddress;
+    uint64_t sahCostAddress;
+    uint64_t leafNodeAddress;
+    uint64_t newNodeIdAddress;
+    uint64_t newTriIdAddress;
+    uint64_t collapsedTreeNodeCountsAddress;
+
+    uint64_t schedulerDataAddress;
+    uint64_t indirectDispatchBufferAddress;
+
+    uint64_t debugAddress;
+
+    uint32_t leafNodeCount;
+    uint32_t maxLeafSize;
+
+    float c_t;
+    float c_i;
+} pc;
+
+#include "taskScheduler.glsl"
+
+#define INVALID_ID -1
+
+#define COLLAPSING_SIZE_THRESHOLD 15
+#define NODE_STATE_SUBTREE 69
+#define NODE_STATE_LEAF 420
+#define NODE_STATE_INVALID -1
+
+const uint32_t SC_subgroupCount = gl_WorkGroupSize.x / SC_subgroupSize;
+
+shared uint32_t sharedPrefix;
+shared uint32_t aggregatePerSubgroup[SC_subgroupCount];
+
+uint divCeil(in uint a, in uint b)
+{
+    return (a + b - 1) / b;
+}
+
+void decideLeafOrInternal(in uint32_t taskId)
+{
+    uint32_t nodeId = taskId * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (nodeId >= pc.leafNodeCount)
+        return;
+
+    u32Buf counter = u32Buf(pc.counterAddress);
+    u32Buf nodeState = u32Buf(pc.nodeStateAddress);
+    u32Buf sahCost = u32Buf(pc.sahCostAddress);
+    BvhBinaryDOP14 bvh = BvhBinaryDOP14(pc.bvhAddress);
+
+    NodeBvhBinaryDOP14 node = bvh.node[nodeId];
+    float nodeSurfaceArea = bvArea(node.bv);
+    // leaf node size is always 1
+    sahCost.val[nodeId] = floatBitsToUint(nodeSurfaceArea * pc.c_i);
+    nodeState.val[nodeId] = NODE_STATE_LEAF;
+
+    nodeId = bvh.node[nodeId].parent;
+    while (atomicAdd(counter.val[nodeId], 1) > 0) {
+        node = bvh.node[nodeId];
+        nodeSurfaceArea = bvArea(node.bv);
+
+        float costAsSubtree = nodeSurfaceArea * pc.c_t;
+        costAsSubtree += uintBitsToFloat(sahCost.val[node.c0]);
+        costAsSubtree += uintBitsToFloat(sahCost.val[node.c1]);
+
+        float costAsLeaf = 1e69f;
+        // if (node.size <= COLLAPSING_SIZE_THRESHOLD)
+        if (node.size <= pc.maxLeafSize)
+            costAsLeaf = nodeSurfaceArea * node.size * pc.c_i;
+
+        if (costAsSubtree > costAsLeaf) {
+            nodeState.val[nodeId] = NODE_STATE_LEAF;
+            sahCost.val[nodeId] = floatBitsToUint(costAsLeaf);
+        }
+        else {
+            nodeState.val[nodeId] = NODE_STATE_SUBTREE;
+            sahCost.val[nodeId] = floatBitsToUint(costAsSubtree);
+        }
+        memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
+
+        nodeId = node.parent;
+        if (nodeId == INVALID_ID)
+            return;
+    }
+}
+
+void findCollapsedRoots(in uint32_t taskId)
+{
+    const uint32_t nodeId = taskId * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (nodeId >= pc.leafNodeCount)
+        return;
+
+    BvhBinaryDOP14 bvh = BvhBinaryDOP14(pc.bvhAddress);
+    u32Buf nodeState = u32Buf(pc.nodeStateAddress);
+    u32Buf leafId = u32Buf(pc.leafNodeAddress);
+
+    uint32_t leafNodeId = nodeId;
+    uint32_t parentNodeId = bvh.node[nodeId].parent;
+    uint32_t parentNodeState = nodeState.val[parentNodeId];
+
+    while (true) {
+        if (parentNodeState == NODE_STATE_LEAF)
+            leafNodeId = parentNodeId;
+
+        parentNodeId = bvh.node[parentNodeId].parent;
+        if (parentNodeId == INVALID_ID)
+            break;
+        parentNodeState = nodeState.val[parentNodeId];
+    }
+    leafId.val[nodeId] = leafNodeId;
+}
+
+void invalidateCollapsedNodes(in uint32_t taskId)
+{
+    uint32_t nodeId = taskId * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (nodeId >= pc.leafNodeCount)
+        return;
+
+    BvhBinaryDOP14 bvh = BvhBinaryDOP14(pc.bvhAddress);
+    u32Buf counter = u32Buf(pc.counterAddress);
+    u32Buf nodeState = u32Buf(pc.nodeStateAddress);
+    u32Buf leafId = u32Buf(pc.leafNodeAddress);
+
+    uint32_t leafNodeId = leafId.val[nodeId];
+    if (nodeId == leafNodeId)
+        return;
+    nodeState.val[nodeId] = NODE_STATE_INVALID;
+
+    nodeId = bvh.node[nodeId].parent;
+    while (atomicAdd(counter.val[nodeId], 1) > 0) {
+        if (nodeId == leafNodeId)
+            return;
+        nodeState.val[nodeId] = NODE_STATE_INVALID;
+
+        memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
+        nodeId = bvh.node[nodeId].parent;
+        if (nodeId == INVALID_ID)
+            return;
+    }
+}
+
+void computeNewNodeIds(in uint32_t taskId)
+{
+    uint32_t nodeId = taskId * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint32_t totalNodeCount = 2 * pc.leafNodeCount - 1;
+    if (nodeId >= totalNodeCount)
+        return;
+
+    BvhBinaryDOP14 bvh = BvhBinaryDOP14(pc.bvhAddress);
+    u32Buf nodeCounts = u32Buf(pc.collapsedTreeNodeCountsAddress);
+    u32Buf nodeState = u32Buf(pc.nodeStateAddress);
+    u32Buf nodeNewId = u32Buf(pc.newNodeIdAddress);
+
+    uint32_t myState = nodeState.val[nodeId];
+    uint32_t myNewOffset = 0;
+
+    const uint32_t rootId = totalNodeCount - 1;
+
+    uint32_t offset = 0;
+    uvec4 ballot = subgroupBallot(myState == NODE_STATE_SUBTREE && nodeId != rootId);
+//    uvec4 ballot = subgroupBallot(myState == NODE_STATE_SUBTREE);
+    if (subgroupElect())
+        offset = atomicAdd(nodeCounts.val[0], subgroupBallotBitCount(ballot));
+    offset = subgroupBroadcastFirst(offset) + subgroupBallotExclusiveBitCount(ballot);
+    if (myState == NODE_STATE_SUBTREE)
+        myNewOffset = offset;
+
+    ballot = subgroupBallot(myState == NODE_STATE_LEAF);
+    if (subgroupElect())
+        offset = atomicAdd(nodeCounts.val[1], subgroupBallotBitCount(ballot));
+    offset = subgroupBroadcastFirst(offset) + subgroupBallotExclusiveBitCount(ballot);
+    if (myState == NODE_STATE_LEAF)
+        myNewOffset = offset;
+
+    // root id is set during the collapse() func
+    if (nodeId == rootId)
+        myNewOffset = INVALID_ID;
+
+    nodeNewId.val[nodeId] = myNewOffset;
+}
+
+void computeNewTriangleOffsets(in uint32_t taskId)
+{
+    uint32_t nodeId = taskId * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint32_t totalNodeCount = 2 * pc.leafNodeCount - 1;
+    if (nodeId >= totalNodeCount)
+        return;
+
+    BvhBinaryDOP14 bvh = BvhBinaryDOP14(pc.bvhAddress);
+    u32Buf counter = u32Buf(pc.counterAddress);
+    u32Buf nodeState = u32Buf(pc.nodeStateAddress);
+    u32Buf newTriOffset = u32Buf(pc.newTriIdAddress);
+
+    uint32_t myState = nodeState.val[nodeId];
+    uint32_t mySize = 0;
+    if (myState == NODE_STATE_LEAF)
+        mySize = bvh.node[nodeId].size;
+
+    // init DL data
+    if (gl_LocalInvocationID.x == 0)
+        sharedPrefix = 0;
+    if (gl_LocalInvocationID.x < SC_subgroupSize)
+        aggregatePerSubgroup[gl_LocalInvocationID.x] = 0;
+    barrier();
+
+    uint32_t inclusiveSum = subgroupInclusiveAdd(mySize);
+    if (gl_SubgroupInvocationID == (SC_subgroupSize - 1))
+        aggregatePerSubgroup[gl_SubgroupID] = inclusiveSum;
+    barrier();
+
+    uint32_t total = 0;
+    if (gl_SubgroupID == 0) {
+        uint32_t mySubgroupAggregate = aggregatePerSubgroup[gl_SubgroupInvocationID];
+        total = subgroupInclusiveAdd(mySubgroupAggregate);
+        // store exclusive sum
+        aggregatePerSubgroup[gl_SubgroupInvocationID] = total - mySubgroupAggregate;
+        // store total aggregate for this workgroup
+        if (gl_SubgroupInvocationID == (SC_subgroupSize - 1))
+            sharedPrefix = atomicAdd(counter.val[2], total);
+    }
+    barrier();
+
+    if (myState == NODE_STATE_LEAF)
+        newTriOffset.val[nodeId] = sharedPrefix + aggregatePerSubgroup[gl_SubgroupID] + inclusiveSum - mySize;
+}
+
+void collapse(in uint32_t taskId)
+{
+    uint32_t nodeId = taskId * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint32_t totalNodeCount = 2 * pc.leafNodeCount - 1;
+    if (nodeId >= totalNodeCount)
+        return;
+
+    BvhBinaryDOP14 bvh = BvhBinaryDOP14(pc.bvhAddress);
+    BvhBinaryDOP14 bvhCollapsed = BvhBinaryDOP14(pc.bvhCollapsedAddress);
+    i32Buf nodeCounts = i32Buf(pc.collapsedTreeNodeCountsAddress);
+    u32Buf nodeState = u32Buf(pc.nodeStateAddress);
+    i32Buf nodeIdNew = i32Buf(pc.newNodeIdAddress);
+    i32Buf triOffsetNew = i32Buf(pc.newTriIdAddress);
+
+    const int32_t numberOfLeaves = nodeCounts.val[1];
+
+    uint32_t myState = nodeState.val[nodeId];
+    if (myState == NODE_STATE_INVALID)
+        return;
+
+    int32_t newNodeId = nodeIdNew.val[nodeId];
+    // unresolved root remap to keep root on defined (last) position
+    if (nodeId == (totalNodeCount - 1))
+        newNodeId = nodeCounts.val[0];
+
+    if (myState == NODE_STATE_SUBTREE)
+        newNodeId += numberOfLeaves;
+
+    NodeBvhBinaryDOP14 node = bvh.node[nodeId];
+    if (node.parent != INVALID_ID) {
+        // TODO: root node as a parent situation here is scuffed, rework?
+        int32_t newParentOffset = nodeIdNew.val[node.parent];
+        if (newParentOffset == INVALID_ID)
+            newParentOffset = nodeCounts.val[0];
+
+        node.parent = newParentOffset + numberOfLeaves;
+    }
+
+    if (myState == NODE_STATE_LEAF) {
+        node.c0 = triOffsetNew.val[nodeId];
+        node.c1 = node.c0 + node.size;
+        node.size = -node.size;
+    }
+    else {
+        node.c0 = (nodeState.val[node.c0] == NODE_STATE_LEAF) ? -nodeIdNew.val[node.c0] : nodeIdNew.val[node.c0] + numberOfLeaves;
+        node.c1 = (nodeState.val[node.c1] == NODE_STATE_LEAF) ? -nodeIdNew.val[node.c1] : nodeIdNew.val[node.c1] + numberOfLeaves;
+    }
+
+    bvhCollapsed.node[newNodeId] = node;
+}
+
+void copyTriangles(in uint32_t taskId)
+{
+    uint32_t nodeId = taskId * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (nodeId >= pc.leafNodeCount)
+        return;
+
+    u32Buf leafId = u32Buf(pc.leafNodeAddress);
+    i32Buf triOffsetNew = i32Buf(pc.newTriIdAddress);
+    BvhTriangles bvhTriangles = BvhTriangles(pc.bvhTrianglesAddress);
+    BvhTriangles bvhCollapsedTriangles = BvhTriangles(pc.bvhCollapsedTrianglesAddress);
+    BvhTriangleIndices bvhTriangleIndices = BvhTriangleIndices(pc.bvhTriangleIndicesAddress);
+    BvhTriangleIndices bvhCollapsedTriangleIndices = BvhTriangleIndices(pc.bvhCollapsedTriangleIndicesAddress);
+
+    uint32_t leafNodeId = leafId.val[nodeId];
+    uint32_t myTriOffset = atomicAdd(triOffsetNew.val[leafNodeId], 1);
+    bvhCollapsedTriangles.t[myTriOffset] = bvhTriangles.t[nodeId];
+    bvhCollapsedTriangleIndices.val[myTriOffset] = bvhTriangleIndices.val[nodeId];
+}
+
+void fResetCounter(in uint32_t taskId)
+{
+    uint32_t nodeId = taskId * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint32_t totalNodeCount = 2 * pc.leafNodeCount - 1;
+    if (nodeId >= totalNodeCount)
+        return;
+
+    u32Buf counter = u32Buf(pc.counterAddress);
+    counter.val[nodeId] = 0;
+}
+
+#define COLLAPSING_1_LEAF_OR_INTERNAL 0
+#define COLLAPSING_1_RESET_COUNTER 1
+#define COLLAPSING_2_SUBTREE_ROOTS 2
+#define COLLAPSING_2_RESET_COUNTER 3
+#define COLLAPSING_3_INVALIDATE_SUBTREES 4
+#define COLLAPSING_3_RESET_COUNTER 5
+#define COLLAPSING_4_REMAP_IDS 6
+#define COLLAPSING_4_RESET_COUNTER 7
+#define COLLAPSING_5_TRIANGLE_OFFSETS 8
+#define COLLAPSING_6_COLLAPSE_BVH 9
+#define COLLAPSING_7_COPY_TRI_INDICES 10
+#define COLLAPSING_DONE 11
+
+void main()
+{
+    BvhBinaryDOP14 bvh = BvhBinaryDOP14(pc.bvhAddress);
+    BvhBinaryDOP14 bvhCollapsed = BvhBinaryDOP14(pc.bvhCollapsedAddress);
+
+    if (gl_GlobalInvocationID.x == 0) {
+        i32Buf nodeCounts = i32Buf(pc.collapsedTreeNodeCountsAddress);
+        nodeCounts.val[0] = 0;
+        nodeCounts.val[1] = 0;
+
+        allocTasks(gl_NumWorkGroups.x, COLLAPSING_1_LEAF_OR_INTERNAL);
+    }
+
+    while (true) {
+        Task task = beginTask(gl_LocalInvocationID.x);
+
+        switch (task.phase) {
+            case COLLAPSING_1_LEAF_OR_INTERNAL:
+                decideLeafOrInternal(task.id);
+
+                if (endTask(gl_LocalInvocationID.x)) {
+                    uint32_t totalNodeCount = 2 * pc.leafNodeCount - 1;
+                    uint32_t newTaskCount = divCeil(totalNodeCount, gl_WorkGroupSize.x);
+                    allocTasks(newTaskCount, COLLAPSING_1_RESET_COUNTER);
+                }
+                break;
+            case COLLAPSING_1_RESET_COUNTER:
+                fResetCounter(task.id);
+
+                if (endTask(gl_LocalInvocationID.x))
+                    allocTasks(gl_NumWorkGroups.x, COLLAPSING_2_SUBTREE_ROOTS);
+                break;
+            case COLLAPSING_2_SUBTREE_ROOTS:
+                findCollapsedRoots(task.id);
+
+                if (endTask(gl_LocalInvocationID.x))
+                    allocTasks(gl_NumWorkGroups.x, COLLAPSING_3_INVALIDATE_SUBTREES);
+                break;
+            case COLLAPSING_3_INVALIDATE_SUBTREES:
+                invalidateCollapsedNodes(task.id);
+
+                if (endTask(gl_LocalInvocationID.x)) {
+                    uint32_t totalNodeCount = 2 * pc.leafNodeCount - 1;
+                    uint32_t newTaskCount = divCeil(totalNodeCount, gl_WorkGroupSize.x);
+                    allocTasks(newTaskCount, COLLAPSING_4_REMAP_IDS);
+                }
+                break;
+            case COLLAPSING_4_REMAP_IDS:
+                computeNewNodeIds(task.id);
+
+                if (endTask(gl_LocalInvocationID.x)) {
+                    uint32_t totalNodeCount = 2 * pc.leafNodeCount - 1;
+                    uint32_t newTaskCount = divCeil(totalNodeCount, gl_WorkGroupSize.x);
+                    allocTasks(newTaskCount, COLLAPSING_5_TRIANGLE_OFFSETS);
+                }
+                break;
+            case COLLAPSING_5_TRIANGLE_OFFSETS:
+                computeNewTriangleOffsets(task.id);
+
+                if (endTask(gl_LocalInvocationID.x)) {
+                    uint32_t totalNodeCount = 2 * pc.leafNodeCount - 1;
+                    uint32_t newTaskCount = divCeil(totalNodeCount, gl_WorkGroupSize.x);
+                    allocTasks(newTaskCount, COLLAPSING_6_COLLAPSE_BVH);
+                }
+                break;
+            case COLLAPSING_6_COLLAPSE_BVH:
+                collapse(task.id);
+
+                if (endTask(gl_LocalInvocationID.x))
+                    allocTasks(gl_NumWorkGroups.x, COLLAPSING_7_COPY_TRI_INDICES);
+                break;
+            case COLLAPSING_7_COPY_TRI_INDICES:
+                copyTriangles(task.id);
+
+                if (endTask(gl_LocalInvocationID.x)) {
+                    // store dispatch data for processing the collapsed bvh
+                    u32Buf nodeCounts = u32Buf(pc.collapsedTreeNodeCountsAddress);
+                    // u32Buf indirectDispatch = u32Buf(pc.indirectDispatchBufferAddress);
+                    // indirectDispatch.val[0] = divCeil(nodeCounts.val[1], gl_WorkGroupSize.x);
+                    // indirectDispatch.val[1] = 1;
+                    // indirectDispatch.val[2] = 1;
+
+                    allocTasks(gl_NumWorkGroups.x, COLLAPSING_DONE);
+                }
+                break;
+            case COLLAPSING_DONE:
+                return;
+        }
+    };
+}
+

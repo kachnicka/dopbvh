@@ -1,0 +1,523 @@
+#version 460
+
+#extension GL_EXT_buffer_reference2: require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: require
+
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_EXT_shader_realtime_clock: require
+
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#extension GL_GOOGLE_include_directive : enable
+
+#define INCLUDE_FROM_SHADER
+#include "data_bvh.h"
+#include "data_scene.h"
+#include "data_types_general.glsl"
+
+// TODO: include based on volume used
+#include "bv_aabb.glsl"
+#include "bv_dop14.glsl"
+
+#include "bvh_compressed_binary.glsl"
+
+#include "random.glsl"
+#include "rayCommon.glsl"
+
+layout(set = 0, binding = 0, rgba32f) uniform image2D image;
+layout(set = 0, binding = 1) uniform Camera {
+    mat4 view;
+    mat4 projection;
+    mat4 viewInv;
+    mat4 projectionInv;
+} camera;
+layout(push_constant) uniform uPushConstant
+{
+    PC_PT data;
+    
+} pc;
+layout (local_size_x = 32, local_size_y = 2, local_size_z = 1) in;
+#define SCHEDULER_DATA_ADDRESS pc.data.schedulerDataAddress
+#include "taskScheduler.glsl"
+
+#define EPS 1e-5f
+#define INVALID_ID -1
+#define STACK_SIZE 128
+#define DYNAMIC_FETCH_THRESHOLD 20
+#define BOTTOM_OF_STACK 0x76543210
+
+#define MAX_DEPTH 7
+
+shared uint nextRay[gl_WorkGroupSize.y];
+
+uint divCeil(in uint a, in uint b)
+{
+    return (a + b - 1) / b;
+}
+
+void generatePrimaryRays(in uint taskId)
+{
+    ivec2 imgSize = imageSize(image);
+
+    
+    #define sg_SIZE_TO_BECOME_SPEC_CONST 32
+    uint tileCountX = divCeil(uint(imgSize.x), sg_SIZE_TO_BECOME_SPEC_CONST);
+    uvec2 tileId = uvec2(taskId % tileCountX, taskId / tileCountX);
+    ivec2 imgCoords = ivec2(tileId * gl_WorkGroupSize.xy + gl_LocalInvocationID.xy);
+    
+
+    if (imgCoords.x >= imgSize.x || imgCoords.y >= imgSize.y)
+        return;
+
+    uint seed = tea(imgCoords.y * imgSize.x + imgCoords.x, pc.data.samplesComputed);
+    // TODO: read correct sample id for accumulation
+    uint sampleId = pc.data.samplesComputed;
+    const vec2 subpixelJitter = sampleId == 0 ? vec2(.5f) : vec2(rnd(seed), rnd(seed));
+    const vec2 pixelCenter    = vec2(imgCoords) + subpixelJitter;
+    const vec2 inUV           = pixelCenter / vec2(imgSize.xy);
+    const vec2 d              = inUV * 2.f - 1.f;
+
+    Ray ray;
+    vec4 target = camera.projectionInv * vec4(d.x, d.y, 1.f, 1.f);
+    ray.o = camera.viewInv * vec4(0.f, 0.f, 0.f, 1.f);
+    ray.d = camera.viewInv * vec4(normalize(target.xyz), 0.f);
+
+    ray.o.w = .01f;
+    ray.d.w = BIG_FLOAT;
+
+    RayBuf rayBuffer = RayBuf(pc.data.rayBuffer0Address);
+    RayPayloadBuf rayPayload = RayPayloadBuf(pc.data.rayPayload0Address);
+
+    // maintaining a per tile ray coherence, likely can be improved by a Morton curve
+    const uint tileX = min(gl_WorkGroupSize.x, imgSize.x - tileId.x * gl_WorkGroupSize.x);
+    const uint tileY = min(gl_WorkGroupSize.y, imgSize.y - tileId.y * gl_WorkGroupSize.y);
+    const uint rowOffset = tileId.y * gl_WorkGroupSize.y * imgSize.x;
+    const uint colOffset = tileId.x * gl_WorkGroupSize.x * tileY;
+    //    const uint localOffset = gl_LocalInvocationID.y * tileX + gl_LocalInvocationID.x;
+    const uint localOffset = gl_LocalInvocationID.x * tileY + gl_LocalInvocationID.y;
+    const uint rayBufferOffset = rowOffset + colOffset + localOffset;
+
+    rayBuffer.ray[rayBufferOffset] = ray;
+    rayPayload.val[rayBufferOffset].packedPosition = imgCoords.x << 18 | imgCoords.y << 4 | RAY_TYPE_PRIMARY;
+    rayPayload.val[rayBufferOffset].seed = seed;
+    rayPayload.val[rayBufferOffset].throughput = vec3(1.f);
+
+    uint[3] padding = { 0, 0, 0 };
+    rayPayload.val[rayBufferOffset].padding = padding;
+
+    if (taskId == 0 && gl_LocalInvocationIndex == 0) {
+        RayBufferMetadata_ref rayBufMeta = RayBufferMetadata_ref(pc.data.rayBufferMetadataAddress);
+        rayBufMeta.data_0.rayCount = imgSize.x * imgSize.y;
+        rayBufMeta.data_0.rayTracedCount = 0;
+        rayBufMeta.data_0.depth_TMP = 0;
+        rayBufMeta.data_1.rayCount = 0;
+        rayBufMeta.data_1.rayTracedCount = 0;
+    }
+}
+    
+struct RayInfo {
+    RayBuf rayBuffer;
+    RayPayloadBuf rayPayload;
+};
+
+void shadeAndCast(in uint taskId)
+{
+    RayBufferMetadata_ref rayBufMeta = RayBufferMetadata_ref(pc.data.rayBufferMetadataAddress);
+
+    const uint depth = rayBufMeta.data_0.depth_TMP;
+    const bool useIdx0 = (depth % 2) == 0;
+    RayInfo rayInfoRead = useIdx0
+        ? RayInfo(RayBuf(pc.data.rayBuffer0Address), RayPayloadBuf(pc.data.rayPayload0Address))
+        : RayInfo(RayBuf(pc.data.rayBuffer1Address), RayPayloadBuf(pc.data.rayPayload1Address));
+
+    const uint rayCount = useIdx0 ? rayBufMeta.data_0.rayCount : rayBufMeta.data_1.rayCount;
+
+    const uint rayId = taskId * gl_WorkGroupSize.x * gl_WorkGroupSize.y + gl_LocalInvocationIndex;
+
+    if (rayId >= rayCount)
+        return;
+
+    uint32_t packedPixelPos = rayInfoRead.rayPayload.val[rayId].packedPosition;
+    ivec2 pixelPos = ivec2(packedPixelPos >> 18, (packedPixelPos >> 4) & 0x3FFF);
+
+    RayTraceResultBuf results = RayTraceResultBuf(pc.data.rayTraceResultAddress);
+    RayTraceResult result = results.result[rayId];
+    Ray r = rayInfoRead.rayBuffer.ray[rayId];
+
+
+    const vec3 clearColor = vec3(.15f);
+    vec3 throughput = rayInfoRead.rayPayload.val[rayId].throughput;
+    vec3 radiance = vec3(0.f);
+    vec3 accumulatedRadiance = vec3(0.f);
+    if (pc.data.samplesComputed > 0)
+        accumulatedRadiance = imageLoad(image, pixelPos).xyz;
+
+    vec3 env = vec3(max(0.f, dot(r.d.xyz, pc.data.dirLight.xyz)));
+    env *= pc.data.dirLight.w;
+
+    // hit environment
+    if (result.instanceId == INVALID_ID) {
+        if (depth == 0)
+            radiance = clearColor;
+        else
+            radiance = throughput * env;
+        radiance = (pc.data.samplesComputed * accumulatedRadiance + radiance) / float(pc.data.samplesComputed + 1);
+        imageStore(image, pixelPos, vec4(radiance, 1.f));
+        return;
+    }
+    if (depth + 1 > MAX_DEPTH) {
+        radiance = (pc.data.samplesComputed * accumulatedRadiance + radiance) / float(pc.data.samplesComputed + 1);
+        imageStore(image, pixelPos, vec4(radiance, 1.f));
+        return;
+    }
+
+
+    // cast secondary ray
+    GeometryDescriptor gDesc = GeometryDescriptor(pc.data.geometryDescriptorAddress);
+
+    Geometry g = gDesc.g[result.instanceId];
+    uvec3Buf indices = uvec3Buf(g.idxAddress);
+    const uvec3 idx = indices.val[result.primitiveId];
+    //    fvec3Buf vertices = fvec3Buf(g.vtxAddress);
+    //    const vec3 v0 = vertices.val[idx.x];
+    //    const vec3 v1 = vertices.val[idx.y];
+    //    const vec3 v2 = vertices.val[idx.z];
+    fvec3Buf normals = fvec3Buf(g.normalAddress);
+    const vec3 n0 = normals.val[idx.x];
+    const vec3 n1 = normals.val[idx.y];
+    const vec3 n2 = normals.val[idx.z];
+
+    //    const vec3 barycentrics = vec3(1.0 - result.u - result.v, result.u, result.v);
+    const vec3 barycentrics = vec3(result.u, result.v, 1.f - result.u - result.v);
+
+    const vec3 pos = r.o.xyz + r.d.xyz * result.t;
+    //    const vec3 pos = v0 * barycentrics.x + v1 * barycentrics.y + v2 * barycentrics.z;
+    vec3 nrm = n0 * barycentrics.x + n1 * barycentrics.y + n2 * barycentrics.z;
+    //    const vec3 worldNrm = normalize(vec3(nrm * prd.worldToObject));  // Transforming the normal to world space
+    //    const vec3 worldPos = vec3(prd.objectToWorld * vec4(pos, 1.0));  // Transforming the position to world space
+
+    uint32_t seed = rayInfoRead.rayPayload.val[rayId].seed;
+    // Lambert sample
+    const vec3 albedo = vec3(1.f);
+    const vec3 newDirection = SampleHemisphereCosineWorldSpace(rnd(seed), rnd(seed), nrm);
+    const float cosTheta = dot(newDirection, nrm);
+    const vec3 f = albedo * M_PI_INV;
+    const float pdf = cosTheta * M_PI_INV;
+
+    throughput *= (f * cosTheta) / pdf;
+    r.o = vec4(OffsetRay(pos, nrm), .01f);
+    r.d = vec4(newDirection, BIG_FLOAT);
+
+    RayInfo rayInfoWrite = useIdx0
+        ? RayInfo(RayBuf(pc.data.rayBuffer1Address), RayPayloadBuf(pc.data.rayPayload1Address))
+        : RayInfo(RayBuf(pc.data.rayBuffer0Address), RayPayloadBuf(pc.data.rayPayload0Address));
+
+    const uvec4 ballot = subgroupBallot(true);
+    uint32_t newRayId;
+    if (subgroupElect()) {
+//        newRayId = atomicAdd(useIdx0 ? rayBufMeta.data_1.rayCount : rayBufMeta.data_0.rayCount, subgroupBallotBitCount(ballot));
+        if (useIdx0)
+            newRayId = atomicAdd(rayBufMeta.data_1.rayCount, subgroupBallotBitCount(ballot));
+        else
+            newRayId = atomicAdd(rayBufMeta.data_0.rayCount, subgroupBallotBitCount(ballot));
+    }
+    newRayId = subgroupBroadcastFirst(newRayId) + subgroupBallotExclusiveBitCount(ballot);
+
+    packedPixelPos = (packedPixelPos & ~0xfu) | RAY_TYPE_SECONDARY;
+    rayInfoWrite.rayBuffer.ray[newRayId] = r;
+    rayInfoWrite.rayPayload.val[newRayId].packedPosition = packedPixelPos;
+    rayInfoWrite.rayPayload.val[newRayId].seed = seed;
+    rayInfoWrite.rayPayload.val[newRayId].throughput = throughput;
+
+    rayInfoWrite.rayPayload.val[newRayId].padding[0] += result.bvIntersectionCount;
+}
+
+void trace()
+{
+    bool anyHit = false;
+
+    
+
+
+    uint stackId;
+    int traversalStack[STACK_SIZE];
+    traversalStack[0] = BOTTOM_OF_STACK;
+
+    int nodeId = BOTTOM_OF_STACK;
+    int leafId;
+    uint rayId;
+    float tmin;
+    vec3 origin, dir;
+
+    RayTraceResult result;
+    uint traversedNodes;
+    uint testedTriangles;
+
+    Stats stats = Stats(pc.data.ptStatsAddress);
+    RayBufferMetadata_ref rayBufMeta = RayBufferMetadata_ref(pc.data.rayBufferMetadataAddress);
+    const bool useIdx0 = (rayBufMeta.data_0.depth_TMP % 2) == 0;
+    RayBuf rayBuffer = useIdx0 ? RayBuf(pc.data.rayBuffer0Address) : RayBuf(pc.data.rayBuffer1Address);
+    const uint rayCount = useIdx0 ? rayBufMeta.data_0.rayCount : rayBufMeta.data_1.rayCount;
+
+    BvhBinaryOBBCompressed bvh = BvhBinaryOBBCompressed(pc.data.bvhAddress);
+    BvhTriangles triangles = BvhTriangles(pc.data.bvhTrianglesAddress);
+    BvhTriangleIndices triangleIndices = BvhTriangleIndices(pc.data.bvhTriangleIndicesAddress);
+
+    while (true) {
+        const bool isTerminated = (nodeId == BOTTOM_OF_STACK);
+        const uvec4 ballot = subgroupBallot(isTerminated);
+        const uint terminatedCount = subgroupBallotBitCount(ballot);
+        const uint terminatedId = subgroupBallotExclusiveBitCount(ballot);
+
+        if (isTerminated) {
+            traversedNodes = 0;
+            testedTriangles = 0;
+
+            if (terminatedId == 0) {
+                if (useIdx0)
+                    nextRay[gl_SubgroupID] = atomicAdd(rayBufMeta.data_0.rayTracedCount, terminatedCount);
+                else
+                    nextRay[gl_SubgroupID] = atomicAdd(rayBufMeta.data_1.rayTracedCount, terminatedCount);
+            }
+            memoryBarrier(gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+
+            rayId = nextRay[gl_SubgroupID] + terminatedId;
+            if (rayId >= rayCount)
+                break;
+
+            const Ray ray = rayBuffer.ray[rayId];
+
+            origin = ray.o.xyz;
+            tmin = ray.o.w;
+            dir = ray.d.xyz;
+            result.t = ray.d.w;
+
+            
+
+
+            stackId = 0;
+            leafId = 0;
+            nodeId = 0;
+
+            result.instanceId = INVALID_ID;
+            result.primitiveId = INVALID_ID;
+            result.bvIntersectionCount = 0;
+            result.u = -1.f;
+            result.v = -1.f;
+        }
+
+        while (nodeId != BOTTOM_OF_STACK)
+        {
+            while (uint(nodeId) < uint(BOTTOM_OF_STACK))
+            {
+                ++traversedNodes;
+
+                
+            mat4 m0 = mat4(vec4(bvh.node[nodeId].bv[0][0], 0.f), vec4(bvh.node[nodeId].bv[0][1], 0.f), vec4(bvh.node[nodeId].bv[0][2], 0.f), vec4(bvh.node[nodeId].bv[0][3], 1.f));
+            mat4 m1 = mat4(vec4(bvh.node[nodeId].bv[1][0], 0.f), vec4(bvh.node[nodeId].bv[1][1], 0.f), vec4(bvh.node[nodeId].bv[1][2], 0.f), vec4(bvh.node[nodeId].bv[1][3], 1.f));
+
+            vec3 d0 = vec3(m0 * vec4(dir, 0.f));
+            vec3 o0 = vec3(m0 * vec4(origin, 1.f));
+            vec3 idir0, ood0;
+            idir0.x = 1.f / (abs(d0.x) > EPS ? d0.x : EPS * sign(d0.x));
+            idir0.y = 1.f / (abs(d0.y) > EPS ? d0.y : EPS * sign(d0.y));
+            idir0.z = 1.f / (abs(d0.z) > EPS ? d0.z : EPS * sign(d0.z));
+            ood0 = o0 * idir0;
+            vec3 d1 = vec3(m1 * vec4(dir, 0.f));
+            vec3 o1 = vec3(m1 * vec4(origin, 1.f));
+            vec3 idir1, ood1;
+            idir1.x = 1.f / (abs(d1.x) > EPS ? d1.x : EPS * sign(d1.x));
+            idir1.y = 1.f / (abs(d1.y) > EPS ? d1.y : EPS * sign(d1.y));
+            idir1.z = 1.f / (abs(d1.z) > EPS ? d1.z : EPS * sign(d1.z));
+            ood1 = o1 * idir1;
+
+            const vec4 n0xy = vec4(-.5f, .5f, -.5f, .5f);
+            const vec4 n1xy = vec4(-.5f, .5f, -.5f, .5f);
+            const vec4 nz = vec4(-.5f, .5f, -.5f, .5f);
+            const float c0lox = n0xy.x * idir0.x - ood0.x;
+            const float c0hix = n0xy.y * idir0.x - ood0.x;
+            const float c0loy = n0xy.z * idir0.y - ood0.y;
+            const float c0hiy = n0xy.w * idir0.y - ood0.y;
+            const float c0loz = nz.x   * idir0.z - ood0.z;
+            const float c0hiz = nz.y   * idir0.z - ood0.z;
+            const float c1loz = nz.z   * idir1.z - ood1.z;
+            const float c1hiz = nz.w   * idir1.z - ood1.z;
+            const float c0min = max(max(min(c0lox, c0hix), min(c0loy, c0hiy)), max(min(c0loz, c0hiz), tmin));
+            const float c0max = min(min(max(c0lox, c0hix), max(c0loy, c0hiy)), min(max(c0loz, c0hiz), result.t));
+            const float c1lox = n1xy.x * idir1.x - ood1.x;
+            const float c1hix = n1xy.y * idir1.x - ood1.x;
+            const float c1loy = n1xy.z * idir1.y - ood1.y;
+            const float c1hiy = n1xy.w * idir1.y - ood1.y;
+            float c1min = max(max(min(c1lox, c1hix), min(c1loy, c1hiy)), max(min(c1loz, c1hiz), tmin));
+            const float c1max = min(min(max(c1lox, c1hix), max(c1loy, c1hiy)), min(max(c1loz, c1hiz), result.t));
+
+            const bool swp = (c1min < c0min);
+            const bool traverseC0 = (c0max >= c0min);
+            const bool traverseC1 = (c1max >= c1min);
+            ivec2 cnodes = ivec2(bvh.node[nodeId].c0, bvh.node[nodeId].c1);
+        
+
+                if (!traverseC0 && !traverseC1) {
+                    nodeId = traversalStack[stackId];
+                    --stackId;
+                }
+                else {
+                    nodeId = (traverseC0) ? cnodes.x : cnodes.y;
+
+                    if (traverseC0 && traverseC1) {
+                        if (swp) {
+                            int tmp = nodeId;
+                            nodeId = cnodes.y;
+                            cnodes.y = tmp;
+                        }
+                        ++stackId;
+                        traversalStack[stackId] = cnodes.y;
+                    }
+                }
+
+                // postpone one leaf
+                if (nodeId < 0 && leafId >= 0) {
+                    leafId = nodeId;
+                    nodeId = traversalStack[stackId];
+                    --stackId;
+                }
+
+                if (subgroupAll(leafId < 0))
+                    break;
+            }
+
+            while (leafId < 0) {
+                const int triStartId = leafId & 0x07FFFFFF;
+                const int triCount = (leafId >> 27) & 0xF;
+                for (int triId = triStartId; triId < triStartId + triCount; ++triId) {
+                    ++testedTriangles;
+
+                    const vec4 v00 = triangles.t[triId].v0;
+                    const vec4 v11 = triangles.t[triId].v1;
+                    const vec4 v22 = triangles.t[triId].v2;
+
+                    const float t = (v00.w - dot(origin, v00.xyz)) / dot(dir, v00.xyz);
+                    if (t > tmin && t < result.t) {
+                        const float u = v11.w + dot(origin, v11.xyz) + t * dot(dir, v11.xyz);
+                        if (u >= 0.f) {
+                            const float v = v22.w + dot(origin, v22.xyz) + t * dot(dir, v22.xyz);
+                            if (v >= 0.f && u + v <= 1.f) {
+                                result.t = t;
+                                result.u = u;
+                                result.v = v;
+                                result.instanceId = triangleIndices.val[triId].nodeId;
+                                result.primitiveId = triangleIndices.val[triId].triangleId;
+
+                                if (anyHit) {
+                                    nodeId = BOTTOM_OF_STACK;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                leafId = nodeId;
+                // Another leaf was postponed => process it as well.
+                if (nodeId < 0) {
+                    nodeId = traversalStack[stackId];
+                    --stackId;
+                }
+            }
+            // dynamic fetch
+            if (subgroupBallotBitCount(subgroupBallot(true)) < DYNAMIC_FETCH_THRESHOLD)
+                break;
+        }
+
+        result.bvIntersectionCount = traversedNodes;
+        RayTraceResultBuf results = RayTraceResultBuf(pc.data.rayTraceResultAddress);
+        results.result[rayId] = result;
+
+        atomicAdd(stats.data.traversedNodes, traversedNodes);
+        atomicAdd(stats.data.testedTriangles, testedTriangles);
+    }
+}
+
+
+#define PHASE_GENERATE_PRIMARY_RAYS 1
+#define PHASE_TRACE_RAYS 2
+#define PHASE_SHADE_AND_CAST 3
+#define PHASE_DONE 0
+
+void main() {
+    Stats stats = Stats(pc.data.ptStatsAddress);
+    RayBufferMetadata_ref rayBufMeta = RayBufferMetadata_ref(pc.data.rayBufferMetadataAddress);
+
+    if (gl_GlobalInvocationID.x == 0) {
+        uvec2 imgSize = uvec2(imageSize(image));
+        uint taskCount = divCeil(imgSize.x, gl_WorkGroupSize.x) * divCeil(imgSize.y, gl_WorkGroupSize.y);
+      allocTasks(taskCount, PHASE_GENERATE_PRIMARY_RAYS);
+    }
+
+    while (true) {
+        Task task = beginTask(gl_LocalInvocationIndex);
+
+        switch (task.phase) {
+        case PHASE_GENERATE_PRIMARY_RAYS:
+            generatePrimaryRays(task.id);
+
+            if (endTask(gl_LocalInvocationIndex)) {
+                stats.data.timerStart = clockRealtimeEXT();
+                stats.data.traversedNodes = 0;
+                allocTasks(gl_NumWorkGroups.x, PHASE_TRACE_RAYS);
+            }
+            break;
+        case PHASE_TRACE_RAYS:
+            trace();
+
+            if (endTask(gl_LocalInvocationIndex)) {
+                const uint depth = rayBufMeta.data_0.depth_TMP;
+                const bool useIdx0 = (depth % 2) == 0;
+                const uint rayCount = useIdx0 ? rayBufMeta.data_0.rayCount : rayBufMeta.data_1.rayCount;
+                const uint taskCount = divCeil(rayCount, gl_WorkGroupSize.x * gl_WorkGroupSize.y);
+
+                stats.data.times[depth].timer = clockRealtimeEXT() - stats.data.timerStart;
+                stats.data.times[depth].rayCount = rayCount;
+
+//                stats.data.times[depth].padding = useIdx0 ? rayBufMeta.data_0.rayTracedCount: rayBufMeta.data_1.rayTracedCount;
+                stats.data.times[depth].padding = stats.data.traversedNodes;
+
+                allocTasks(taskCount, PHASE_SHADE_AND_CAST);
+            }
+            break;
+        case PHASE_SHADE_AND_CAST:
+            shadeAndCast(task.id);
+
+            if (endTask(gl_LocalInvocationIndex)) {
+                // increment depth
+                rayBufMeta.data_0.depth_TMP++;
+                const bool useIdx0 = (rayBufMeta.data_0.depth_TMP % 2) == 0;
+                const uint rayCount = useIdx0 ? rayBufMeta.data_0.rayCount : rayBufMeta.data_1.rayCount;
+                if (useIdx0) {
+                    rayBufMeta.data_1.rayCount = 0;
+                    rayBufMeta.data_1.rayTracedCount = 0;
+                } else {
+                    rayBufMeta.data_0.rayCount = 0;
+                    rayBufMeta.data_0.rayTracedCount = 0;
+                }
+
+                if (rayCount > 0) {
+                    stats.data.timerStart = clockRealtimeEXT();
+                    stats.data.traversedNodes = 0;
+                    allocTasks(gl_NumWorkGroups.x, PHASE_TRACE_RAYS);
+                } else {
+                    allocTasks(gl_NumWorkGroups.x, PHASE_DONE);
+                }
+            }
+            break;
+        case PHASE_DONE:
+            return;
+        }
+    };
+}
+

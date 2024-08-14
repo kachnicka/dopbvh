@@ -1,0 +1,28 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_buffer_reference2: require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: require
+
+layout(local_size_x_id = 0) in;
+
+#extension GL_GOOGLE_include_directive : enable
+
+#define INCLUDE_FROM_SHADER
+#include "data_plocpp.h"
+
+layout (push_constant, scalar) uniform uPushConstant {
+    PC_CopySortedNodeIds data;
+} pc;
+
+void main() {
+    if (gl_GlobalInvocationID.x >= pc.data.clusterCount)
+        return;
+
+    Morton32KeyVals inM32 = Morton32KeyVals(pc.data.mortonAddress);
+    u32Buf outNodeId = u32Buf(pc.data.nodeIdAddress);
+
+    outNodeId.val[gl_GlobalInvocationID.x] = inM32.keyval[gl_GlobalInvocationID.x].key;
+}

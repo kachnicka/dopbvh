@@ -1,0 +1,19 @@
+# global path prefix for all files, relative to data/; can be also absolute
+path_prefix_scene = 'scene/'
+path_prefix_camera = 'scene/camera/'
+startup_scene = "tree"
+
+[[scenes]]
+name = "tree"
+# relative to path_prefix_scene
+file = 'tree.fbx'
+# relative to path_prefix_camera
+cam = 'camera_chestnut'
+# relative to path_prefix_scene, custom binary format
+#bin = ''
+
+[[scenes]]
+name = "hairball"
+file = ''
+cam = 'camera_hairball'
+bin = 'binary/hairball.ob'

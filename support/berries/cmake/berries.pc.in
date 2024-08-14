@@ -1,0 +1,9 @@
+prefix=@PACKAGE_CMAKE_INSTALL_PREFIX@
+includedir=${prefix}/include
+libdir=${prefix}/lib
+bindir=${prefix}/bin
+
+Name: berries
+Description: helper libraries
+Version: @BERRIES_VERSION@
+Cflags: -I${includedir}
