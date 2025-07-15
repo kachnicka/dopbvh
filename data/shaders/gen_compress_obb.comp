@@ -84,7 +84,7 @@ void compressBvhNodes(in uint taskId)
             nonLeafChildCount++;
         else {
             // encode leaf size and tri address to child field, size has to fit sign bit and threshold used by collapsing kernel
-            // sign : 1; leafSize : 3; triAddress : 28;
+            // sign (isLeafFlag) : 1; leafSize : 4; triAddress : 27;
             NodeBvhBinaryOBB cNode = bvh.node[-node.c1];
             bvhCompressed.node[bvhNodeId].c1 = -((cNode.size & 0xF) << 27) | cNode.c0;
         }
